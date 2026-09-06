@@ -98,7 +98,13 @@ server.on("upgrade", (req, socket, head) => {
 });
 
 function safeSend(ws, obj) {
-  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  try {
+    ws.send(JSON.stringify(obj));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function createOutboundScheduler({
@@ -300,7 +306,27 @@ function accountState() {
   };
 }
 
+let dashboardClient = null;
+const accounts = Array.from({length: 10}, accountState);
+let commandQueueRunning = false;
+const autoKick = {
+  enabled: false,
+  room: "",
+  thresholdMs: 30000,
+  countdownMs: 60000,
+  targets: [],
+  targetDelaysMs: [],
+  loopCount: 1,
+  socketDelayMs: 0,
+  sequentialMode: false,
+  source: null,
+  countdownEndAt: 0,
+  countdownInterval: null,
+  countdownTriggered: false
+};
+
 wss.on("connection", dashboard => {
+  dashboardClient = dashboard;
   dashboard.isAlive = true;
   dashboard.on("pong", () => { dashboard.isAlive = true; });
   const dashboardHeartbeat = setInterval(() => {
@@ -313,27 +339,28 @@ wss.on("connection", dashboard => {
     try { dashboard.ping(); } catch {}
   }, 25000);
 
-  const accounts = Array.from({length: 10}, accountState);
-  let commandQueueRunning = false;
-  const autoKick = {
-    enabled: false,
-    room: "",
-    thresholdMs: 30000,
-    countdownMs: 60000,
-    targets: [],
-    targetDelaysMs: [],
-    loopCount: 1,
-    socketDelayMs: 0,
-    sequentialMode: false,
-    source: null,
-    countdownEndAt: 0,
-    countdownInterval: null,
-    countdownTriggered: false
-  };
-  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "kick-authoritative-room-audit-2026-09-06-v1"});
+  safeSend(dashboardClient, {type: "dashboard.ready", accounts: 10, backendVersion: "persistent-account-sockets-2026-09-06-v1"});
 
   function dashboardStatus(i, status, extra = {}) {
-    safeSend(dashboard, {type: "status", index: i, status, ...extra});
+    safeSend(dashboardClient, {type: "status", index: i, status, ...extra});
+  }
+
+  // Rebind the UI to the existing account sockets after a dashboard reconnect.
+  // No new developer.login is performed here.
+  for (let i = 0; i < accounts.length; i++) {
+    const a = accounts[i];
+    if (!a.username) continue;
+    const status = a.ws && a.ws.readyState === WebSocket.OPEN && a.ready
+      ? "online"
+      : (a.ws ? "connecting" : "offline");
+    safeSend(dashboardClient, {
+      type: "status",
+      index: i,
+      status,
+      username: a.username,
+      balance: a.balance || "-",
+      joinedRooms: [...a.joined]
+    });
   }
 
   // Room audit: record only commands/events actually observed by this client.
@@ -348,12 +375,12 @@ wss.on("connection", dashboard => {
       ...extra
     };
     a.lastRoomCommand = entry;
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "room.audit",
       index: i,
       audit: entry
     });
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "log",
       index: i,
       message: `[ROOM AUDIT] ${direction} ${type}${room ? ` room=${room}` : ""}${extra.target ? ` target=${extra.target}` : ""}${extra.code != null ? ` code=${extra.code}` : ""}${extra.reason ? ` reason=${extra.reason}` : ""}`
@@ -364,7 +391,7 @@ wss.on("connection", dashboard => {
     const remainingMs = autoKick.countdownEndAt
       ? Math.max(0, autoKick.countdownEndAt - Date.now())
       : null;
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "autoKick.state",
       status,
       enabled: autoKick.enabled,
@@ -397,13 +424,13 @@ wss.on("connection", dashboard => {
     autoKick.countdownEndAt = Date.now() + 60000;
     autoKick.countdownTriggered = false;
     autoKick.source = "manual";
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "autoKick.manual.started",
       room: detectedRoom,
       countdownMs: autoKick.countdownMs,
       thresholdMs: autoKick.thresholdMs
     });
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "log",
       index: 0,
       message: `Timer auto kick dimulai manual untuk room ${detectedRoom} dari ${autoKick.countdownMs} ms.`
@@ -416,7 +443,7 @@ wss.on("connection", dashboard => {
 
       if (!autoKick.countdownTriggered && remainingMs <= autoKick.thresholdMs) {
         autoKick.countdownTriggered = true;
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "autoKick.triggered",
           room: autoKick.room,
           thresholdMs: autoKick.thresholdMs,
@@ -424,13 +451,13 @@ wss.on("connection", dashboard => {
         });
 
         if (!autoKick.targets.length) {
-          safeSend(dashboard, {
+          safeSend(dashboardClient, {
             type: "error",
             index: 0,
             message: "Timer selesai, tetapi belum ada target kick yang dipilih."
           });
         } else if (commandQueueRunning) {
-          safeSend(dashboard, {
+          safeSend(dashboardClient, {
             type: "error",
             index: 0,
             message: "Auto Kick tidak dijalankan karena antrian perintah masih berjalan."
@@ -525,7 +552,7 @@ wss.on("connection", dashboard => {
       job.attempts += 1;
       if (job.attempts > 120) {
         a.pendingJobs.delete(jobId);
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "log",
           index: i,
           message: `JOB ${jobId} tidak selesai setelah 60 detik; polling dihentikan`
@@ -541,7 +568,7 @@ wss.on("connection", dashboard => {
   function trackQueuedJob(i, data) {
     const jobId = queuedJobId(data);
     if (!jobId) {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "log",
         index: i,
         message: `API mengembalikan ${data?.type || "queued"} tanpa job_id`
@@ -558,13 +585,13 @@ wss.on("connection", dashboard => {
       target: pendingKick?.target || payload?.target_username || data?.target_username || "",
       attempts: 0
     });
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "log",
       index: i,
       message: `JOB ${jobId} diantrikan (${String(data?.type || "command").replace(/\.queued$/, "")}) target=${pendingKick?.target || "-"}`
     });
     if (command === "room.kick") {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "kick.queued",
         index: i,
         jobId,
@@ -588,7 +615,7 @@ wss.on("connection", dashboard => {
     a.pendingJobs.delete(jobId);
     const ok = ["completed", "complete", "success", "succeeded", "done", "finished"].includes(status);
     const jobMessage = `JOB ${jobId} ${ok ? "selesai" : `gagal (${status})`}${responseError(data) && !ok ? `: ${responseError(data)}` : ""}`;
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "log",
       index: i,
       message: jobMessage
@@ -597,7 +624,7 @@ wss.on("connection", dashboard => {
     // room.kick is an API job: queued is not success. Only a terminal
     // job.get/job.status response is treated as authoritative completion.
     if (job.command === "room.kick") {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "kick.result",
         index: i,
         jobId,
@@ -612,7 +639,7 @@ wss.on("connection", dashboard => {
     const payload = responsePayload(data);
     const wallet = payload?.wallet || payload?.data?.wallet;
     if (wallet) {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "balance",
         index: i,
         balance: wallet.label || String(wallet.balance_cr || "-")
@@ -630,7 +657,7 @@ wss.on("connection", dashboard => {
     a.pingTimer = setInterval(() => {
       if (!a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) return;
       if (a.lastHeartbeatAt && Date.now() - a.lastHeartbeatAt >= 60000) {
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "log",
           index: i,
           message: "PING timeout; socket ditutup"
@@ -639,7 +666,7 @@ wss.on("connection", dashboard => {
         return;
       }
       enqueueOutbound(i, {type: "ping"}, {priority: true});
-      safeSend(dashboard, {type: "log", index: i, message: "PING keep-alive dikirim"});
+      safeSend(dashboardClient, {type: "log", index: i, message: "PING keep-alive dikirim"});
     }, 50000);
   }
 
@@ -722,11 +749,11 @@ wss.on("connection", dashboard => {
     a.ws = ws;
     ws.on("pong", () => {
       a.lastHeartbeatAt = Date.now();
-      safeSend(dashboard, {type: "log", index: i, message: "PONG keep-alive diterima"});
+      safeSend(dashboardClient, {type: "log", index: i, message: "PONG keep-alive diterima"});
     });
 
     ws.on("open", () => {
-      safeSend(dashboard, {type: "log", index: i, message: "WebSocket OPEN; menunggu auth.required"});
+      safeSend(dashboardClient, {type: "log", index: i, message: "WebSocket OPEN; menunggu auth.required"});
     });
 
     ws.on("message", raw => {
@@ -735,7 +762,7 @@ wss.on("connection", dashboard => {
       let data;
       try { data = JSON.parse(raw.toString()); }
       catch {
-        safeSend(dashboard, {type: "raw", index: i, data: raw.toString().slice(0, 1000)});
+        safeSend(dashboardClient, {type: "raw", index: i, data: raw.toString().slice(0, 1000)});
         return;
       }
 
@@ -745,7 +772,7 @@ wss.on("connection", dashboard => {
       if (String(data?.type || "").toLowerCase() === "ping") {
         safeSend(ws, {type: "pong"});
       }
-      safeSend(dashboard, {type: "api", index: i, data});
+      safeSend(dashboardClient, {type: "api", index: i, data});
       if (String(data?.type || "").endsWith(".queued")) trackQueuedJob(i, data);
       // The API documentation defines job.get by request shape and job fields,
       // but does not require one single response event name. Only process a
@@ -756,7 +783,7 @@ wss.on("connection", dashboard => {
         handleJobStatus(i, data);
       }
       if (data.type === "room.participants" || data.type === "room.participants.result") {
-        safeSend(dashboard, {type: "participants.raw", index: i, data: JSON.stringify(data).slice(0, 8000)});
+        safeSend(dashboardClient, {type: "participants.raw", index: i, data: JSON.stringify(data).slice(0, 8000)});
       }
 
 
@@ -768,11 +795,11 @@ wss.on("connection", dashboard => {
         a.authTimer = setTimeout(() => {
           if (a.ws !== ws || a.ready || a.authFailed) return;
           a.authFailed = true;
-          safeSend(dashboard, {type:"log", index:i, message:"AUTH timeout: server tidak menerima session.ready setelah login"});
+          safeSend(dashboardClient, {type:"log", index:i, message:"AUTH timeout: server tidak menerima session.ready setelah login"});
           dashboardStatus(i, "error", {authFailed:true, message:"AUTH timeout"});
           try { ws.close(1000, "authentication timeout"); } catch {}
         }, 60000);
-        safeSend(dashboard, {type: "log", index: i, message: "auth.required diterima"});
+        safeSend(dashboardClient, {type: "log", index: i, message: "auth.required diterima"});
         safeSend(ws, {
           type: "developer.login",
           username: a.username,
@@ -803,7 +830,7 @@ wss.on("connection", dashboard => {
           permissions,
           balance: initialBalance
         });
-        safeSend(dashboard, {type: "log", index: i, message: "LOGIN BERHASIL; keep-alive aktif"});
+        safeSend(dashboardClient, {type: "log", index: i, message: "LOGIN BERHASIL; keep-alive aktif"});
 
         // session.ready normally contains wallet data, but the API explicitly
         // provides wallet.balance as the authoritative way to refresh the
@@ -820,7 +847,7 @@ wss.on("connection", dashboard => {
 
       if (data.type === "error") {
         const err = responseError(data);
-        safeSend(dashboard, {type: "log", index: i, message: `API ERROR: ${publicError(err)}`});
+        safeSend(dashboardClient, {type: "log", index: i, message: `API ERROR: ${publicError(err)}`});
 
         // Authentication failures must never enter a reconnect loop.
         // `developer already has an active websocket` is a connection-state
@@ -847,7 +874,7 @@ wss.on("connection", dashboard => {
           return;
         }
 
-        safeSend(dashboard, {type: "error", index: i, message: publicError(err)});
+        safeSend(dashboardClient, {type: "error", index: i, message: publicError(err)});
         return;
       }
 
@@ -889,9 +916,9 @@ wss.on("connection", dashboard => {
           a.pendingJoinRoom = "";
           // room.join.result confirms room membership only; it must never be
           // used as the login-status signal. session.ready is authoritative.
-          safeSend(dashboard, {type: "log", index: i, message: `JOIN BERHASIL: ${joinedRoom}`});
+          safeSend(dashboardClient, {type: "log", index: i, message: `JOIN BERHASIL: ${joinedRoom}`});
         } else {
-          safeSend(dashboard, {
+          safeSend(dashboardClient, {
             type: "log",
             index: i,
             message: `JOIN response: ${publicError(errorText || status || "tidak sukses")}`
@@ -923,16 +950,16 @@ wss.on("connection", dashboard => {
         const wallet = payload?.wallet || data?.data?.wallet || null;
         if (wallet) {
           const balance = wallet.label || (wallet.balance_cr != null ? `${wallet.balance_cr} CR` : "-");
-          safeSend(dashboard, {type: "balance", index: i, balance});
-          safeSend(dashboard, {type: "log", index: i, message: `SALDO diperbarui: ${balance}`});
+          safeSend(dashboardClient, {type: "balance", index: i, balance});
+          safeSend(dashboardClient, {type: "log", index: i, message: `SALDO diperbarui: ${balance}`});
         } else {
-          safeSend(dashboard, {type: "log", index: i, message: "wallet.balance.result diterima tetapi data wallet kosong"});
+          safeSend(dashboardClient, {type: "log", index: i, message: "wallet.balance.result diterima tetapi data wallet kosong"});
         }
       }
     });
 
     ws.on("error", err => {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "log",
         index: i,
         message: `WebSocket ERROR: ${publicError(err?.message || err)}`
@@ -957,7 +984,7 @@ wss.on("connection", dashboard => {
         reason,
         authFailed: wasAuthFailure
       });
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "log",
         index: i,
         message: `CLOSED code=${code} reason=${reason}`
@@ -969,12 +996,12 @@ wss.on("connection", dashboard => {
   function canSendToAccount(i, payload) {
     const a = accounts[i];
     if (!a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) {
-      safeSend(dashboard, {type: "log", index: i, message: "Belum session.ready; command dilewati"});
+      safeSend(dashboardClient, {type: "log", index: i, message: "Belum session.ready; command dilewati"});
       return false;
     }
     const permission = requiredPermissionFor(payload);
     if (permission && a.permissions.length && !a.permissions.includes(permission)) {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "log",
         index: i,
         message: `Command ${payload.type} dilewati: permission ${permission} tidak tersedia`
@@ -996,7 +1023,7 @@ wss.on("connection", dashboard => {
         a.ready
       ),
       send: payload => a.ws.send(JSON.stringify(payload)),
-      onQueueFull: payload => safeSend(dashboard, {
+      onQueueFull: payload => safeSend(dashboardClient, {
         type: "log",
         index: i,
         message: `Antrean outbound penuh; ${payload.type} dilewati`
@@ -1044,7 +1071,7 @@ wss.on("connection", dashboard => {
   async function runKickQueue(room, targets, delayMs, loopCount, source = "kickAll") {
     if (!room || !targets.length) return {started: false, sent: 0, skipped: 0, total: 0};
     if (commandQueueRunning) {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "error",
         index: 0,
         message: "Kick All masih berjalan. Tunggu sampai selesai sebelum menjalankan lagi."
@@ -1061,7 +1088,7 @@ wss.on("connection", dashboard => {
     let sent = 0;
     let skipped = 0;
 
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "kickQueue.start",
       room,
       targets,
@@ -1072,7 +1099,7 @@ wss.on("connection", dashboard => {
       kickQueueId,
       mode: "10x10-wave"
     });
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "kickQueue.progress",
       done: 0,
       total,
@@ -1101,7 +1128,7 @@ wss.on("connection", dashboard => {
               sent++;
             } else {
               skipped++;
-              safeSend(dashboard, {
+              safeSend(dashboardClient, {
                 type: "log",
                 index: accountIndex,
                 message: `KICK dilewati: ID #${accountIndex + 1} belum siap atau WebSocket belum OPEN`
@@ -1112,7 +1139,7 @@ wss.on("connection", dashboard => {
             // The kick request itself is sent immediately; UI progress is emitted
             // only periodically so rendering cannot become the bottleneck.
             if (actionNo === 1 || actionNo === total || actionNo % 10 === 0) {
-              safeSend(dashboard, {
+              safeSend(dashboardClient, {
                 type: "kickQueue.step",
                 loop,
                 targetIndex: targetIndex + 1,
@@ -1128,13 +1155,13 @@ wss.on("connection", dashboard => {
           }
         }
 
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "log",
           index: 0,
           message: `WAVE ${loop}: ${sent - (loop - 1) * targets.length * 10} request dikirim untuk ${targets.length} target x 10 ID.`
         });
 
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "kickQueue.progress",
           done: actionNo,
           total,
@@ -1150,7 +1177,7 @@ wss.on("connection", dashboard => {
         }
       }
     } catch (err) {
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "kickQueue.error",
         total,
         done: actionNo,
@@ -1159,7 +1186,7 @@ wss.on("connection", dashboard => {
         source,
         message: err?.message || String(err)
       });
-      safeSend(dashboard, {
+      safeSend(dashboardClient, {
         type: "kickQueue.done",
         total,
         done: actionNo,
@@ -1173,7 +1200,7 @@ wss.on("connection", dashboard => {
     }
 
     commandQueueRunning = false;
-    safeSend(dashboard, {
+    safeSend(dashboardClient, {
       type: "kickQueue.done",
       total,
       done: actionNo,
@@ -1188,14 +1215,14 @@ wss.on("connection", dashboard => {
   async function joinAll(room) {
     const name = String(room || "").trim();
     if (!name) return;
-    safeSend(dashboard, {type: "log", index: 0, message: `[ROOM AUDIT] JOIN ALL room=${name}`});
+    safeSend(dashboardClient, {type: "log", index: 0, message: `[ROOM AUDIT] JOIN ALL room=${name}`});
     for (let i = 0; i < 10; i++) {
       const a = accounts[i];
       if (!a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) continue;
 
       // Login status is independent from room membership.
       // Do not change ONLINE/SUKSES to AUTH while waiting for room.join.result.
-      safeSend(dashboard, {type: "log", index: i, message: `JOIN ${name} dikirim`});
+      safeSend(dashboardClient, {type: "log", index: i, message: `JOIN ${name} dikirim`});
       const didSend = sendToAccount(i, {type: "room.join", room: name});
       if (didSend) {
         a.pendingJoinRoom = name;
@@ -1223,7 +1250,7 @@ wss.on("connection", dashboard => {
         if (n === i) continue;
         if (accounts[n].username && accounts[n].username === accounts[i].username) {
           if (accounts[n].ws || accounts[n].ready) {
-            safeSend(dashboard, {type: "log", index: i, message: `LOGIN dibatalkan: username ${accounts[i].username} sudah dipakai koneksi #${n + 1}`});
+            safeSend(dashboardClient, {type: "log", index: i, message: `LOGIN dibatalkan: username ${accounts[i].username} sudah dipakai koneksi #${n + 1}`});
             dashboardStatus(i, "error", {message: "Username sudah memiliki koneksi WebSocket lain"});
             return;
           }
@@ -1246,7 +1273,7 @@ wss.on("connection", dashboard => {
         const password = String(msg.accounts?.[n]?.password || "");
         if (!username || !password) continue;
         if (requested.has(username)) {
-          safeSend(dashboard, {type: "log", index: n, message: `Login All dibatalkan untuk #${n + 1}: username ${username} duplikat pada #${requested.get(username) + 1}`});
+          safeSend(dashboardClient, {type: "log", index: n, message: `Login All dibatalkan untuk #${n + 1}: username ${username} duplikat pada #${requested.get(username) + 1}`});
           dashboardStatus(n, "error", {message: "Username duplikat; satu username hanya satu koneksi"});
           continue;
         }
@@ -1258,7 +1285,7 @@ wss.on("connection", dashboard => {
       for (let n = 0; n < 10; n++) {
         if (!requested.has(accounts[n].username) || !accounts[n].password) continue;
         if (accounts[n].ready && accounts[n].ws?.readyState === WebSocket.OPEN) {
-          safeSend(dashboard, {type: "log", index: n, message: "Login All: sudah Online, login ulang dilewati"});
+          safeSend(dashboardClient, {type: "log", index: n, message: "Login All: sudah Online, login ulang dilewati"});
           continue;
         }
         closeAccount(n, true).then(() => connectAccount(n, {resetBackoff: true}));
@@ -1268,7 +1295,7 @@ wss.on("connection", dashboard => {
 
     if (msg.action === "disconnectAll") {
       for (let n = 0; n < 10; n++) closeAccount(n, true);
-      safeSend(dashboard, {type: "logout.done"});
+      safeSend(dashboardClient, {type: "logout.done"});
       return;
     }
 
@@ -1278,17 +1305,17 @@ wss.on("connection", dashboard => {
       // the actual protocol-level disconnect.
       for (let n = 0; n < 10; n++) {
         try { closeAccount(n, true); } catch (err) {
-          safeSend(dashboard, {type: "log", index: n, message: `Logout cleanup error: ${publicError(err)}`});
+          safeSend(dashboardClient, {type: "log", index: n, message: `Logout cleanup error: ${publicError(err)}`});
           dashboardStatus(n, "offline");
         }
       }
-      safeSend(dashboard, {type: "logout.done"});
+      safeSend(dashboardClient, {type: "logout.done"});
       return;
     }
 
     if (msg.action === "joinAll") {
       const room = String(msg.room || "").trim();
-      if (!room) { safeSend(dashboard, {type:"error", index:0, message:"Nama room wajib diisi."}); return; }
+      if (!room) { safeSend(dashboardClient, {type:"error", index:0, message:"Nama room wajib diisi."}); return; }
       joinAll(room);
       return;
     }
@@ -1318,7 +1345,7 @@ wss.on("connection", dashboard => {
         if (hasJoinedRoom(accounts[n], room)) {
           sendToAccount(n, {type: "room.send_message", room, message});
         } else {
-          safeSend(dashboard, {
+          safeSend(dashboardClient, {
             type: "log",
             index: n,
             message: `SEND dilewati: belum terkonfirmasi masuk room ${room}`
@@ -1346,7 +1373,7 @@ wss.on("connection", dashboard => {
       }
 
       if (source < 0) {
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "error",
           index: 0,
           message: `Tidak ada ID Online yang tercatat masuk room ${room}. Tekan Enter Room — All terlebih dahulu.`
@@ -1356,12 +1383,12 @@ wss.on("connection", dashboard => {
 
       const ok = sendToAccount(source, {type: "room.participants", room});
       if (ok) {
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "participants.source",
           index: source,
           room
         });
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "log",
           index: source,
           message: `LIST USER ${room} dikirim melalui 1 WebSocket saja (ID #${source + 1})`
@@ -1391,14 +1418,14 @@ wss.on("connection", dashboard => {
 
     if (msg.action === "autoKick.reset") {
       stopAutoKickCountdown("manual-reset", null, autoKick.countdownMs);
-      safeSend(dashboard, {type: "log", index: 0, message: "Timer auto kick di-reset."});
+      safeSend(dashboardClient, {type: "log", index: 0, message: "Timer auto kick di-reset."});
       return;
     }
 
     if (msg.action === "autoKick.start") {
       const started = startManualAutoKickCountdown();
       if (!started) {
-        safeSend(dashboard, {
+        safeSend(dashboardClient, {
           type: "error",
           index: 0,
           message: autoKick.countdownEndAt
@@ -1412,7 +1439,7 @@ wss.on("connection", dashboard => {
     if (msg.action === "autoKick.stop") {
       if (autoKick.countdownEndAt) {
         stopAutoKickCountdown("manual-stop", "stopped", 0);
-        safeSend(dashboard, {type: "log", index: 0, message: "Timer auto kick dihentikan manual."});
+        safeSend(dashboardClient, {type: "log", index: 0, message: "Timer auto kick dihentikan manual."});
       } else {
         autoKickState("stopped", {reason: "manual-stop", remainingMs: 0});
       }
@@ -1435,8 +1462,10 @@ wss.on("connection", dashboard => {
 
   dashboard.on("close", () => {
     clearInterval(dashboardHeartbeat);
-    stopAutoKickCountdown("dashboard-closed");
-    for (let i = 0; i < 10; i++) closeAccount(i, true);
+    if (dashboardClient === dashboard) dashboardClient = null;
+    // Dashboard/UI disconnect is not an account logout. Keep all Mig33
+    // account WebSockets alive; explicit Logout/Logout All closes them.
+    console.log("Dashboard disconnected; Mig33 account sockets kept alive");
   });
 });
 
