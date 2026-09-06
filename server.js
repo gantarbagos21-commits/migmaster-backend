@@ -1061,6 +1061,40 @@ wss.on("connection", dashboard => {
         return;
       }
 
+      // Some upstream versions acknowledge developer.login with a result event
+      // instead of session.ready. Treat an explicit successful login response as
+      // authenticated, while never treating a generic response as success.
+      const typeLower = String(data?.type || "").toLowerCase();
+      const loginPayload = data?.data ?? data?.result ?? data?.payload ?? data;
+      const loginSuccess =
+        (typeLower === "developer.login.result" || typeLower === "login.result" ||
+         typeLower === "developer.login.success" || typeLower === "login.success" ||
+         typeLower === "auth.success" || typeLower === "authentication.success") &&
+        loginPayload?.success !== false &&
+        !["error","failed","failure","rejected","denied"].includes(
+          String(loginPayload?.status ?? data?.status ?? "").toLowerCase()
+        );
+
+      if (loginSuccess) {
+        if (a.authTimer) clearTimeout(a.authTimer);
+        a.authTimer = null;
+        a.ready = true;
+        a.authFailed = false;
+        a.reconnectAttempt = 0;
+        a.lastHeartbeatAt = Date.now();
+        const permissions = loginPayload?.developer?.permissions || loginPayload?.permissions || [];
+        a.permissions = Array.isArray(permissions) ? permissions : [];
+        const wallet = loginPayload?.wallet || loginPayload?.developer?.wallet || null;
+        dashboardStatus(i, "online", {
+          permissions: a.permissions,
+          balance: wallet?.label || "-"
+        });
+        safeSend(dashboard, {type: "log", index: i, message: "LOGIN BERHASIL; status SUKSES"});
+        startPing(i);
+        rejoinRequestedRooms(i);
+        return;
+      }
+
       if (data.type === "session.ready") {
         if (a.authTimer) clearTimeout(a.authTimer);
         a.authTimer = null;
@@ -1495,8 +1529,14 @@ wss.on("connection", dashboard => {
     }
 
     if (msg.action === "logoutAll") {
-      for (let n = 0; n < 10; n++) closeAccount(n, true);
+      // Acknowledge immediately so the UI can never wait for socket close events.
       safeSend(dashboard, {type: "logout.done"});
+      for (let n = 0; n < 10; n++) {
+        try { closeAccount(n, true); } catch (err) {
+          safeSend(dashboard, {type: "log", index: n, message: `Logout cleanup error: ${publicError(err)}`});
+          dashboardStatus(n, "offline");
+        }
+      }
       return;
     }
 
