@@ -1043,6 +1043,9 @@ wss.on("connection", dashboard => {
       }
 
       if (data.type === "auth.required") {
+        // Once session.ready has been received, a late/duplicate auth.required
+        // must never downgrade a successful account back to AUTH.
+        if (a.ready) return;
         if (a.authTimer) clearTimeout(a.authTimer);
         a.authTimer = setTimeout(() => {
           if (a.ws !== ws || a.ready || a.authFailed) return;
