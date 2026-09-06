@@ -595,7 +595,7 @@ wss.on("connection", dashboard => {
     countdownInterval: null,
     countdownTriggered: false
   };
-  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "auth-status-fix-2026-09-06-v2"});
+  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "auth-status-balance-fix-2026-09-06-v4"});
 
   function dashboardStatus(i, status, extra = {}) {
     safeSend(dashboard, {type: "status", index: i, status, ...extra});
@@ -1080,12 +1080,23 @@ wss.on("connection", dashboard => {
           [];
         a.permissions = Array.isArray(permissions) ? permissions : [];
         const wallet = data?.data?.wallet || data?.data?.developer?.wallet || null;
+        const initialBalance = wallet?.label || (wallet?.balance_cr != null ? `${wallet.balance_cr} CR` : "-");
 
         dashboardStatus(i, "online", {
           permissions,
-          balance: wallet?.label || "-"
+          balance: initialBalance
         });
         safeSend(dashboard, {type: "log", index: i, message: "LOGIN BERHASIL; keep-alive aktif"});
+
+        // session.ready normally contains wallet data, but the API explicitly
+        // provides wallet.balance as the authoritative way to refresh the
+        // current balance. Request it immediately after authentication so an
+        // account (especially the last/multi-ID connection) cannot remain at
+        // "Saldo -" simply because its session.ready payload had no wallet.
+        if (a.permissions.includes("wallet.read")) {
+          enqueueOutbound(i, {type: "wallet.balance"}, {priority: true});
+        }
+
         startPing(i);
         rejoinRequestedRooms(i);
         return;
@@ -1181,12 +1192,15 @@ wss.on("connection", dashboard => {
       }
 
       if (data.type === "wallet.balance.result") {
-        const wallet = data?.data?.wallet;
-        if (wallet) safeSend(dashboard, {
-          type: "balance",
-          index: i,
-          balance: wallet.label || String(wallet.balance_cr || "-")
-        });
+        const payload = responsePayload(data);
+        const wallet = payload?.wallet || data?.data?.wallet || null;
+        if (wallet) {
+          const balance = wallet.label || (wallet.balance_cr != null ? `${wallet.balance_cr} CR` : "-");
+          safeSend(dashboard, {type: "balance", index: i, balance});
+          safeSend(dashboard, {type: "log", index: i, message: `SALDO diperbarui: ${balance}`});
+        } else {
+          safeSend(dashboard, {type: "log", index: i, message: "wallet.balance.result diterima tetapi data wallet kosong"});
+        }
       }
     });
 
