@@ -559,6 +559,7 @@ function accountState() {
     outboundScheduler: null,
     reconnectTimer: null,
     reconnectAttempt: 0,
+    authTimer: null,
     authFailed: false,
     manuallyClosed: false
   };
@@ -888,20 +889,32 @@ wss.on("connection", dashboard => {
 
   function closeAccount(i, manual = true) {
     const a = accounts[i];
+    // Mark manual logout BEFORE touching the socket so the close handler
+    // can never schedule an automatic reconnect.
     a.manuallyClosed = manual;
     clearReconnect(i);
     stopPing(i);
     stopJobPolling(i);
     stopOutbound(i);
+    if (a.authTimer) clearTimeout(a.authTimer);
+    a.authTimer = null;
     a.ready = false;
+    a.authFailed = false;
     a.joined.clear();
     a.requestedRooms.clear();
     a.subscribedRooms.clear();
     a.pendingJoinRoom = "";
-    if (a.ws) {
-      try { a.ws.close(1000, manual ? "dashboard disconnect" : "replace"); } catch {}
-    }
+    const ws = a.ws;
+    // Detach first so a late close event from the old socket cannot change
+    // the account back to ERROR/ONLINE or trigger reconnect logic.
     a.ws = null;
+    if (ws) {
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.terminate();
+        }
+      } catch {}
+    }
     dashboardStatus(i, "offline");
   }
 
@@ -950,6 +963,8 @@ wss.on("connection", dashboard => {
     stopJobPolling(i);
     stopOutbound(i);
     a.authFailed = false;
+    if (a.authTimer) clearTimeout(a.authTimer);
+    a.authTimer = null;
     a.manuallyClosed = false;
     a.ready = false;
     a.joined.clear();
@@ -1028,6 +1043,14 @@ wss.on("connection", dashboard => {
       }
 
       if (data.type === "auth.required") {
+        if (a.authTimer) clearTimeout(a.authTimer);
+        a.authTimer = setTimeout(() => {
+          if (a.ws !== ws || a.ready || a.authFailed) return;
+          a.authFailed = true;
+          safeSend(dashboard, {type:"log", index:i, message:"AUTH timeout: server tidak menerima session.ready setelah login"});
+          dashboardStatus(i, "error", {authFailed:true, message:"AUTH timeout"});
+          try { ws.close(1000, "authentication timeout"); } catch {}
+        }, 15000);
         safeSend(dashboard, {type: "log", index: i, message: "auth.required diterima"});
         safeSend(ws, {
           type: "developer.login",
@@ -1039,6 +1062,8 @@ wss.on("connection", dashboard => {
       }
 
       if (data.type === "session.ready") {
+        if (a.authTimer) clearTimeout(a.authTimer);
+        a.authTimer = null;
         a.ready = true;
         a.authFailed = false;
         a.reconnectAttempt = 0;
@@ -1171,6 +1196,8 @@ wss.on("connection", dashboard => {
 
       stopPing(i);
       stopOutbound(i);
+      if (a.authTimer) clearTimeout(a.authTimer);
+      a.authTimer = null;
       const reason = reasonBuf?.toString() || "-";
       const wasAuthFailure = a.authFailed || reason.includes("authentication failed");
       a.ready = false;
@@ -1419,8 +1446,6 @@ wss.on("connection", dashboard => {
       }
 
       // Mark the room only after room.join.result confirms success.
-      // Avoid bursting all room commands at once.
-      await new Promise(resolve => setTimeout(resolve, 600));
     }
   }
 
@@ -1457,7 +1482,7 @@ wss.on("connection", dashboard => {
             safeSend(dashboard, {type: "log", index: n, message: "Login All: sedang Connecting, login ulang dilewati"});
             continue;
           }
-          setTimeout(() => connectAccount(n, {resetBackoff: true}), n * 500);
+          connectAccount(n, {resetBackoff: true});
         }
       }
       return;
