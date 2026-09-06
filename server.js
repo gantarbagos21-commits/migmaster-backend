@@ -1061,48 +1061,8 @@ wss.on("connection", dashboard => {
         return;
       }
 
-      // Some upstream versions acknowledge developer.login with a result event
-      // instead of session.ready. Treat an explicit successful login response as
-      // authenticated, while never treating a generic response as success.
-      const typeLower = String(data?.type || "").toLowerCase();
-      const loginPayload = data?.data ?? data?.result ?? data?.payload ?? data;
-      const loginStatus = String(
-        loginPayload?.status ?? loginPayload?.state ?? loginPayload?.result ??
-        data?.status ?? data?.state ?? ""
-      ).toLowerCase();
-      const loginTypeSuccess =
-        typeLower === "developer.login.result" || typeLower === "login.result" ||
-        typeLower === "developer.login.success" || typeLower === "login.success" ||
-        typeLower === "auth.success" || typeLower === "authentication.success";
-      const loginSuccessFlag = loginPayload?.success === true || data?.success === true;
-      const loginReadyFlag =
-        loginPayload?.authenticated === true || data?.authenticated === true ||
-        loginPayload?.authenticated === "true" || data?.authenticated === "true" ||
-        ["online","success","succeeded","complete","completed","ready","authenticated","connected"].includes(loginStatus);
-      const loginSuccess =
-        (loginTypeSuccess || loginSuccessFlag || loginReadyFlag) &&
-        loginPayload?.success !== false && data?.success !== false &&
-        !["error","failed","failure","rejected","denied","invalid"].includes(loginStatus);
-
-      if (loginSuccess) {
-        if (a.authTimer) clearTimeout(a.authTimer);
-        a.authTimer = null;
-        a.ready = true;
-        a.authFailed = false;
-        a.reconnectAttempt = 0;
-        a.lastHeartbeatAt = Date.now();
-        const permissions = loginPayload?.developer?.permissions || loginPayload?.permissions || [];
-        a.permissions = Array.isArray(permissions) ? permissions : [];
-        const wallet = loginPayload?.wallet || loginPayload?.developer?.wallet || null;
-        dashboardStatus(i, "online", {
-          permissions: a.permissions,
-          balance: wallet?.label || "-"
-        });
-        safeSend(dashboard, {type: "log", index: i, message: "LOGIN BERHASIL; status SUKSES"});
-        startPing(i);
-        rejoinRequestedRooms(i);
-        return;
-      }
+      // Login success is authoritative only when the API sends session.ready.
+      // Do not infer success from generic result/status fields.
 
       if (data.type === "session.ready") {
         if (a.authTimer) clearTimeout(a.authTimer);
@@ -1521,10 +1481,10 @@ wss.on("connection", dashboard => {
             safeSend(dashboard, {type: "log", index: n, message: "Login All: sudah Online, login ulang dilewati"});
             continue;
           }
-          if (accounts[n].ws?.readyState === WebSocket.CONNECTING) {
-            safeSend(dashboard, {type: "log", index: n, message: "Login All: sedang Connecting, login ulang dilewati"});
-            continue;
-          }
+
+          // If an earlier attempt is stuck in CONNECTING/AUTH, discard that
+          // socket and start a fresh connection immediately. No artificial delay.
+          if (accounts[n].ws) closeAccount(n, true);
           connectAccount(n, {resetBackoff: true});
         }
       }
