@@ -1053,7 +1053,7 @@ wss.on("connection", dashboard => {
           safeSend(dashboard, {type:"log", index:i, message:"AUTH timeout: server tidak menerima session.ready setelah login"});
           dashboardStatus(i, "error", {authFailed:true, message:"AUTH timeout"});
           try { ws.close(1000, "authentication timeout"); } catch {}
-        }, 15000);
+        }, 60000);
         safeSend(dashboard, {type: "log", index: i, message: "auth.required diterima"});
         safeSend(ws, {
           type: "developer.login",
