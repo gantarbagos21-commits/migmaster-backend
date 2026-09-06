@@ -1574,14 +1574,12 @@ wss.on("connection", dashboard => {
       const room = String(msg.room || "").trim();
       if (!room) return;
 
-      // List User Room intentionally uses ONE already-joined websocket only.
-      // The first ready account that has confirmed the room is used as the
-      // participant-list source, so the API is not queried 10 times and the
-      // dashboard receives one authoritative participant response.
+      // TEST MODE: List User Room tries one logged-in websocket without requiring
+      // a prior room.join. The API may reject this if the room must be joined.
       let source = -1;
       for (let n = 0; n < 10; n++) {
         const a = accounts[n];
-        if (a.ready && hasJoinedRoom(a, room) && a.ws?.readyState === WebSocket.OPEN) {
+        if (a.ready && a.ws?.readyState === WebSocket.OPEN) {
           source = n;
           break;
         }
@@ -1591,7 +1589,7 @@ wss.on("connection", dashboard => {
         safeSend(dashboard, {
           type: "error",
           index: 0,
-          message: `Tidak ada ID Online yang tercatat masuk room ${room}. Tekan Enter Room — All terlebih dahulu.`
+          message: `Tidak ada ID Online yang siap digunakan untuk mengambil list room ${room}.`
         });
         return;
       }
