@@ -298,6 +298,7 @@ function accountState() {
     jobPollTimer: null,
     pendingJobs: new Map(),
     pendingKickDispatches: [],
+    kickRunIds: new Set(),
     outboundScheduler: null,
     authTimer: null,
     authFailed: false,
@@ -339,7 +340,7 @@ wss.on("connection", dashboard => {
     try { dashboard.ping(); } catch {}
   }, 25000);
 
-  safeSend(dashboardClient, {type: "dashboard.ready", accounts: 10, backendVersion: "persistent-account-sockets-2026-09-06-v2"});
+  safeSend(dashboardClient, {type: "dashboard.ready", accounts: 10, backendVersion: "persistent-account-sockets-kickall-v3-2026-09-06"});
 
   function dashboardStatus(i, status, extra = {}) {
     safeSend(dashboardClient, {type: "status", index: i, status, ...extra});
@@ -597,6 +598,10 @@ wss.on("connection", dashboard => {
       command,
       room: pendingKick?.room || payload?.room || data?.room || "",
       target: pendingKick?.target || payload?.target_username || data?.target_username || "",
+      runId: pendingKick?.runId || "",
+      loop: pendingKick?.loop || 0,
+      targetIndex: pendingKick?.targetIndex || 0,
+      actionNo: pendingKick?.actionNo || 0,
       attempts: 0
     });
     safeSend(dashboardClient, {
@@ -646,8 +651,24 @@ wss.on("connection", dashboard => {
         target: job.target,
         status,
         success: ok,
-        error: ok ? "" : responseError(data)
+        error: ok ? "" : responseError(data),
+        runId: job.runId || "",
+        loop: job.loop || 0,
+        targetIndex: job.targetIndex || 0,
+        actionNo: job.actionNo || 0
       });
+      if (job.runId) {
+        safeSend(dashboardClient, {
+          type: "kickQueue.job",
+          runId: job.runId,
+          index: i,
+          jobId,
+          target: job.target,
+          success: ok,
+          status,
+          terminal: true
+        });
+      }
     }
 
     const payload = responsePayload(data);
@@ -1062,19 +1083,36 @@ wss.on("connection", dashboard => {
     return true;
   }
 
-  function sendKickToAccount(i, payload) {
+  function sendKickToAccount(i, payload, meta = {}) {
     const a = accounts[i];
     if (!a || !a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) return false;
+    if (!hasJoinedRoom(a, payload.room)) {
+      safeSend(dashboardClient, {
+        type: "log",
+        index: i,
+        message: `KICK dilewati: ID #${i + 1} belum terkonfirmasi masuk room ${payload.room}`
+      });
+      return false;
+    }
     if (!canSendToAccount(i, payload)) return false;
     a.pendingKickDispatches.push({
       room: String(payload?.room || ""),
-      target: String(payload?.target_username || "")
+      target: String(payload?.target_username || ""),
+      runId: String(meta.runId || ""),
+      loop: Number(meta.loop || 0),
+      targetIndex: Number(meta.targetIndex || 0),
+      actionNo: Number(meta.actionNo || 0)
     });
     try {
-      // Kick requests deliberately bypass the normal outbound scheduler.
-      // One wave is the complete 10-ID x 10-target matrix.
+      // room.kick is a documented queued API command. We send the exact
+      // protocol payload and use job_id/job.get for authoritative completion.
       a.ws.send(JSON.stringify(payload));
-      auditRoom(i, "OUT", "room.kick", payload.room, {target: payload.target_username, source: "kickQueue"});
+      auditRoom(i, "OUT", "room.kick", payload.room, {
+        target: payload.target_username,
+        source: "kickQueue",
+        runId: meta.runId || "",
+        actionNo: meta.actionNo || 0
+      });
       return true;
     } catch {
       a.pendingKickDispatches.pop();
@@ -1090,12 +1128,45 @@ wss.on("connection", dashboard => {
         index: 0,
         message: "Kick All masih berjalan. Tunggu sampai selesai sebelum menjalankan lagi."
       });
-      return {started: false, sent: 0, skipped: 0, total: targets.length * 10 * loopCount};
+      return {started: false, sent: 0, skipped: 0, total: 0};
     }
 
-    const total = targets.length * 10 * loopCount;
     const loopDelayMs = clampDelayMs(delayMs);
     const kickQueueId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const uniqueTargets = [...new Set(targets.map(v => String(v || "").trim()).filter(Boolean))].slice(0, 10);
+    const preflight = uniqueTargets.map(target => ({
+      target,
+      eligible: accounts
+        .map((a, index) => ({a, index}))
+        .filter(({a}) => a.ready && a.ws?.readyState === WebSocket.OPEN && hasJoinedRoom(a, room) && (!a.permissions.length || a.permissions.includes("rooms.kick")))
+        .map(({index}) => index + 1)
+    }));
+    const total = preflight.reduce((sum, item) => sum + item.eligible.length * loopCount, 0);
+
+    safeSend(dashboardClient, {
+      type: "kickQueue.preflight",
+      room,
+      targets: uniqueTargets,
+      voters: [...new Set(preflight.flatMap(item => item.eligible))],
+      detail: preflight,
+      total,
+      loopCount,
+      source,
+      kickQueueId
+    });
+
+    if (!total) {
+      safeSend(dashboardClient, {
+        type: "kickQueue.error",
+        total: 0,
+        done: 0,
+        sent: 0,
+        skipped: uniqueTargets.length,
+        source,
+        message: `Tidak ada akun ONLINE yang terkonfirmasi masuk room ${room} dan memiliki permission rooms.kick.`
+      });
+      return {started: false, sent: 0, skipped: uniqueTargets.length, total: 0};
+    }
 
     commandQueueRunning = true;
     let actionNo = 0;
@@ -1105,53 +1176,58 @@ wss.on("connection", dashboard => {
     safeSend(dashboardClient, {
       type: "kickQueue.start",
       room,
-      targets,
+      targets: uniqueTargets,
       loopDelayMs,
       loopCount,
       total,
       source,
       kickQueueId,
-      mode: "10x10-wave"
-    });
-    safeSend(dashboardClient, {
-      type: "kickQueue.progress",
-      done: 0,
-      total,
-      sent: 0,
-      skipped: 0,
-      source,
-      mode: "10x10-wave"
+      mode: "joined-accounts-wave"
     });
 
     try {
       for (let loop = 1; loop <= loopCount; loop++) {
-        // ONE WAVE = every ready ID sends room.kick to every selected target.
-        // 10 IDs x 10 targets = 100 room.kick requests, with no wait between
-        // targets and no participant/job completion gate between targets.
-        for (let targetIndex = 0; targetIndex < targets.length; targetIndex++) {
-          const target = targets[targetIndex];
-          for (let accountIndex = 0; accountIndex < 10; accountIndex++) {
+        for (let targetIndex = 0; targetIndex < uniqueTargets.length; targetIndex++) {
+          const target = uniqueTargets[targetIndex];
+          // Re-evaluate membership for every target. A vote-kick can change
+          // room state while this queue is running, so never assume an ID is
+          // still an eligible voter from the initial snapshot.
+          const eligible = accounts
+            .map((a, index) => ({a, index}))
+            .filter(({a}) => a.ready && a.ws?.readyState === WebSocket.OPEN && hasJoinedRoom(a, room) && (!a.permissions.length || a.permissions.includes("rooms.kick")))
+            .map(({index}) => index);
+
+          safeSend(dashboardClient, {
+            type: "kickQueue.target",
+            runId: kickQueueId,
+            loop,
+            targetIndex: targetIndex + 1,
+            target,
+            eligibleAccounts: eligible.map(index => index + 1),
+            eligibleCount: eligible.length
+          });
+
+          if (!eligible.length) {
+            skipped++;
+            continue;
+          }
+
+          for (const accountIndex of eligible) {
             actionNo++;
             const didSend = sendKickToAccount(accountIndex, {
               type: "room.kick",
               room,
               target_username: target
+            }, {
+              runId: kickQueueId,
+              loop,
+              targetIndex: targetIndex + 1,
+              actionNo
             });
 
-            if (didSend) {
-              sent++;
-            } else {
-              skipped++;
-              safeSend(dashboardClient, {
-                type: "log",
-                index: accountIndex,
-                message: `KICK dilewati: ID #${accountIndex + 1} belum siap atau WebSocket belum OPEN`
-              });
-            }
+            if (didSend) sent++;
+            else skipped++;
 
-            // Do not flood the dashboard with 100 individual render events.
-            // The kick request itself is sent immediately; UI progress is emitted
-            // only periodically so rendering cannot become the bottleneck.
             if (actionNo === 1 || actionNo === total || actionNo % 10 === 0) {
               safeSend(dashboardClient, {
                 type: "kickQueue.step",
@@ -1161,19 +1237,14 @@ wss.on("connection", dashboard => {
                 accountIndex: accountIndex + 1,
                 actionNo,
                 total,
-                sent: didSend,
+                sent,
+                skipped,
                 status: didSend ? "sent" : "skipped",
-                mode: "10x10-wave"
+                mode: "joined-accounts-wave"
               });
             }
           }
         }
-
-        safeSend(dashboardClient, {
-          type: "log",
-          index: 0,
-          message: `WAVE ${loop}: ${sent - (loop - 1) * targets.length * 10} request dikirim untuk ${targets.length} target x 10 ID.`
-        });
 
         safeSend(dashboardClient, {
           type: "kickQueue.progress",
@@ -1183,7 +1254,7 @@ wss.on("connection", dashboard => {
           skipped,
           loop,
           source,
-          mode: "10x10-wave"
+          mode: "joined-accounts-wave"
         });
 
         if (loop < loopCount && loopDelayMs > 0) {
@@ -1200,15 +1271,6 @@ wss.on("connection", dashboard => {
         source,
         message: err?.message || String(err)
       });
-      safeSend(dashboardClient, {
-        type: "kickQueue.done",
-        total,
-        done: actionNo,
-        sent,
-        skipped,
-        source,
-        error: true
-      });
       commandQueueRunning = false;
       return {started: true, sent, skipped, total, error: err?.message || String(err)};
     }
@@ -1221,30 +1283,11 @@ wss.on("connection", dashboard => {
       sent,
       skipped,
       source,
-      mode: "10x10-wave"
+      mode: "joined-accounts-wave",
+      dispatched: true,
+      note: "Selesai mengirim vote-kick. Hasil akhir tiap job tetap mengikuti job.get/job status API."
     });
     return {started: true, sent, skipped, total};
-  }
-
-  async function joinAll(room) {
-    const name = String(room || "").trim();
-    if (!name) return;
-    safeSend(dashboardClient, {type: "log", index: 0, message: `[ROOM AUDIT] JOIN ALL room=${name}`});
-    for (let i = 0; i < 10; i++) {
-      const a = accounts[i];
-      if (!a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) continue;
-
-      // Login status is independent from room membership.
-      // Do not change ONLINE/SUKSES to AUTH while waiting for room.join.result.
-      safeSend(dashboardClient, {type: "log", index: i, message: `JOIN ${name} dikirim`});
-      const didSend = sendToAccount(i, {type: "room.join", room: name});
-      if (didSend) {
-        a.pendingJoinRoom = name;
-        a.requestedRooms.add(name);
-      }
-
-      // Mark the room only after room.join.result confirms success.
-    }
   }
 
   dashboard.on("message", async raw => {
