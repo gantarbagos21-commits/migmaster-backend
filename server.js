@@ -339,7 +339,7 @@ wss.on("connection", dashboard => {
     try { dashboard.ping(); } catch {}
   }, 25000);
 
-  safeSend(dashboardClient, {type: "dashboard.ready", accounts: 10, backendVersion: "persistent-account-sockets-2026-09-06-v1"});
+  safeSend(dashboardClient, {type: "dashboard.ready", accounts: 10, backendVersion: "persistent-account-sockets-2026-09-06-v2"});
 
   function dashboardStatus(i, status, extra = {}) {
     safeSend(dashboardClient, {type: "status", index: i, status, ...extra});
@@ -347,21 +347,35 @@ wss.on("connection", dashboard => {
 
   // Rebind the UI to the existing account sockets after a dashboard reconnect.
   // No new developer.login is performed here.
-  for (let i = 0; i < accounts.length; i++) {
-    const a = accounts[i];
-    if (!a.username) continue;
-    const status = a.ws && a.ws.readyState === WebSocket.OPEN && a.ready
-      ? "online"
-      : (a.ws ? "connecting" : "offline");
-    safeSend(dashboardClient, {
-      type: "status",
-      index: i,
-      status,
-      username: a.username,
-      balance: a.balance || "-",
-      joinedRooms: [...a.joined]
-    });
+  function sendDashboardSnapshot() {
+    for (let i = 0; i < accounts.length; i++) {
+      const a = accounts[i];
+      if (!a.username && !a.ws && !a.ready && !a.joined.size) continue;
+      const status = a.ws && a.ws.readyState === WebSocket.OPEN && a.ready
+        ? "online"
+        : (a.ws ? "connecting" : "offline");
+      safeSend(dashboardClient, {
+        type: "status",
+        index: i,
+        status,
+        username: a.username,
+        balance: a.balance || "-",
+        joinedRooms: [...a.joined],
+        requestedRooms: [...a.requestedRooms]
+      });
+      safeSend(dashboardClient, {
+        type: "account.snapshot",
+        index: i,
+        username: a.username,
+        status,
+        ready: !!a.ready,
+        socketOpen: !!(a.ws && a.ws.readyState === WebSocket.OPEN),
+        joinedRooms: [...a.joined],
+        requestedRooms: [...a.requestedRooms]
+      });
+    }
   }
+  sendDashboardSnapshot();
 
   // Room audit: record only commands/events actually observed by this client.
   // This does not infer undocumented server behaviour.
@@ -1240,6 +1254,17 @@ wss.on("connection", dashboard => {
 
     const i = Number(msg.index);
 
+    if (msg.action === "dashboard.sync") {
+      sendDashboardSnapshot();
+      safeSend(dashboardClient, {
+        type: "dashboard.sync.done",
+        accounts: accounts.length,
+        connectedAccounts: accounts.filter(a => a.ready && a.ws?.readyState === WebSocket.OPEN).length,
+        joinedAccountCount: accounts.filter(a => a.joined.size > 0).length
+      });
+      return;
+    }
+
     if (msg.action === "login" && Number.isInteger(i) && i >= 0 && i < 10) {
       accounts[i].username = String(msg.username || "").trim();
       accounts[i].password = String(msg.password || "");
@@ -1465,7 +1490,7 @@ wss.on("connection", dashboard => {
     if (dashboardClient === dashboard) dashboardClient = null;
     // Dashboard/UI disconnect is not an account logout. Keep all Mig33
     // account WebSockets alive; explicit Logout/Logout All closes them.
-    console.log("Dashboard disconnected; Mig33 account sockets kept alive");
+    console.log("Dashboard disconnected; Mig33 account sockets kept alive; no relogin triggered");
   });
 });
 
