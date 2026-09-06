@@ -595,7 +595,7 @@ wss.on("connection", dashboard => {
     countdownInterval: null,
     countdownTriggered: false
   };
-  safeSend(dashboard, {type: "dashboard.ready", accounts: 10});
+  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "auth-status-fix-2026-09-06-v2"});
 
   function dashboardStatus(i, status, extra = {}) {
     safeSend(dashboard, {type: "status", index: i, status, ...extra});
