@@ -1,7 +1,9 @@
-MigMaster - Vercel Frontend
+MigMaster Frontend
 
-This package is intentionally static: index.html is at the ZIP root.
-Deploy with Vercel Drop. No build command is required.
+index.html adalah frontend statis untuk Vercel.
 
-The WebSocket backend must run separately on a persistent Node.js host.
-Set the backend WebSocket URL in the MigMaster UI.
+Backend WebSocket WAJIB dijalankan pada Node.js persistent (Render/Railway/VPS).
+Masukkan URL backend pada field:
+wss://DOMAIN-BACKEND-ANDA/ws
+
+Jangan masukkan URL Vercel frontend sebagai URL backend WebSocket.

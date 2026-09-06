@@ -1,12 +1,17 @@
 {
-  "name": "migmaster-vercel",
-  "version": "1.0.1",
+  "name": "migmaster-node-persistent",
+  "version": "3.0.1-node-persistent-no-vote-queue",
   "private": true,
-  "main": "api/index.js",
+  "main": "server.js",
   "scripts": {
-    "build": "node -e \"console.log('MigMaster Vercel Node build OK')\""
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "check": "node --check server.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
   }
 }
