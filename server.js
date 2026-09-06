@@ -299,6 +299,7 @@ function accountState() {
     pendingJobs: new Map(),
     pendingKickDispatches: [],
     kickRunIds: new Set(),
+    completedKickActions: new Set(),
     outboundScheduler: null,
     authTimer: null,
     authFailed: false,
@@ -658,6 +659,12 @@ wss.on("connection", dashboard => {
         actionNo: job.actionNo || 0
       });
       if (job.runId) {
+        // Mark this exact dispatch as terminal before the queue advances to
+        // the next target. This prevents multiple room.kick jobs for the
+        // same account from being mixed across targets.
+        if (Number.isFinite(Number(job.actionNo)) && Number(job.actionNo) > 0) {
+          a.completedKickActions.add(Number(job.actionNo));
+        }
         safeSend(dashboardClient, {
           type: "kickQueue.job",
           runId: job.runId,
@@ -1123,11 +1130,7 @@ wss.on("connection", dashboard => {
   async function runKickQueue(room, targets, delayMs, loopCount, source = "kickAll") {
     if (!room || !targets.length) return {started: false, sent: 0, skipped: 0, total: 0};
     if (commandQueueRunning) {
-      safeSend(dashboardClient, {
-        type: "error",
-        index: 0,
-        message: "Kick All masih berjalan. Tunggu sampai selesai sebelum menjalankan lagi."
-      });
+      safeSend(dashboardClient, {type: "error", index: 0, message: "Kick All masih berjalan. Tunggu sampai selesai sebelum menjalankan lagi."});
       return {started: false, sent: 0, skipped: 0, total: 0};
     }
 
@@ -1136,12 +1139,12 @@ wss.on("connection", dashboard => {
     const uniqueTargets = [...new Set(targets.map(v => String(v || "").trim()).filter(Boolean))].slice(0, 10);
     const preflight = uniqueTargets.map(target => ({
       target,
-      eligible: accounts
-        .map((a, index) => ({a, index}))
+      eligible: accounts.map((a, index) => ({a, index}))
         .filter(({a}) => a.ready && a.ws?.readyState === WebSocket.OPEN && hasJoinedRoom(a, room) && (!a.permissions.length || a.permissions.includes("rooms.kick")))
         .map(({index}) => index + 1)
     }));
-    const total = preflight.reduce((sum, item) => sum + item.eligible.length * loopCount, 0);
+    const voterCount = [...new Set(preflight.flatMap(item => item.eligible))].length;
+    const total = uniqueTargets.length * voterCount * loopCount;
 
     safeSend(dashboardClient, {
       type: "kickQueue.preflight",
@@ -1152,10 +1155,11 @@ wss.on("connection", dashboard => {
       total,
       loopCount,
       source,
-      kickQueueId
+      kickQueueId,
+      mode: "sequential-target-waves"
     });
 
-    if (!total) {
+    if (!voterCount) {
       safeSend(dashboardClient, {
         type: "kickQueue.error",
         total: 0,
@@ -1169,9 +1173,11 @@ wss.on("connection", dashboard => {
     }
 
     commandQueueRunning = true;
+    accounts.forEach(a => a.completedKickActions.clear());
     let actionNo = 0;
     let sent = 0;
     let skipped = 0;
+    let completed = 0;
 
     safeSend(dashboardClient, {
       type: "kickQueue.start",
@@ -1182,18 +1188,31 @@ wss.on("connection", dashboard => {
       total,
       source,
       kickQueueId,
-      mode: "joined-accounts-wave"
+      mode: "sequential-target-waves"
     });
+
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+    async function waitForActions(actionNos, timeoutMs = 70000) {
+      const wanted = new Set(actionNos);
+      const startedAt = Date.now();
+      while (wanted.size && Date.now() - startedAt < timeoutMs) {
+        for (const a of accounts) {
+          for (const action of wanted) {
+            if (a.completedKickActions.has(action)) wanted.delete(action);
+          }
+        }
+        if (!wanted.size) return true;
+        await sleep(250);
+      }
+      return wanted.size === 0;
+    }
 
     try {
       for (let loop = 1; loop <= loopCount; loop++) {
         for (let targetIndex = 0; targetIndex < uniqueTargets.length; targetIndex++) {
           const target = uniqueTargets[targetIndex];
-          // Re-evaluate membership for every target. A vote-kick can change
-          // room state while this queue is running, so never assume an ID is
-          // still an eligible voter from the initial snapshot.
-          const eligible = accounts
-            .map((a, index) => ({a, index}))
+          const eligible = accounts.map((a, index) => ({a, index}))
             .filter(({a}) => a.ready && a.ws?.readyState === WebSocket.OPEN && hasJoinedRoom(a, room) && (!a.permissions.length || a.permissions.includes("rooms.kick")))
             .map(({index}) => index);
 
@@ -1204,14 +1223,21 @@ wss.on("connection", dashboard => {
             targetIndex: targetIndex + 1,
             target,
             eligibleAccounts: eligible.map(index => index + 1),
-            eligibleCount: eligible.length
+            eligibleCount: eligible.length,
+            mode: "sequential-target-waves"
           });
 
           if (!eligible.length) {
-            skipped++;
+            skipped += voterCount;
             continue;
           }
 
+          // Critical fix: one outstanding room.kick per account at a time.
+          // The API returns an asynchronous job_id. Sending target B on the
+          // same account before target A reaches a terminal job state can
+          // cause queue ordering/correlation problems. We therefore finish
+          // the complete voter wave for target A before advancing to B.
+          const waveActions = [];
           for (const accountIndex of eligible) {
             actionNo++;
             const didSend = sendKickToAccount(accountIndex, {
@@ -1224,54 +1250,59 @@ wss.on("connection", dashboard => {
               targetIndex: targetIndex + 1,
               actionNo
             });
-
-            if (didSend) sent++;
-            else skipped++;
-
-            if (actionNo === 1 || actionNo === total || actionNo % 10 === 0) {
-              safeSend(dashboardClient, {
-                type: "kickQueue.step",
-                loop,
-                targetIndex: targetIndex + 1,
-                target,
-                accountIndex: accountIndex + 1,
-                actionNo,
-                total,
-                sent,
-                skipped,
-                status: didSend ? "sent" : "skipped",
-                mode: "joined-accounts-wave"
-              });
+            if (didSend) {
+              sent++;
+              waveActions.push(actionNo);
+            } else {
+              skipped++;
             }
+
+            safeSend(dashboardClient, {
+              type: "kickQueue.step",
+              loop,
+              targetIndex: targetIndex + 1,
+              target,
+              accountIndex: accountIndex + 1,
+              actionNo,
+              total,
+              sent,
+              skipped,
+              status: didSend ? "sent" : "skipped",
+              mode: "sequential-target-waves"
+            });
           }
+
+          const sentWaveActions = waveActions;
+          if (sentWaveActions.length) {
+            const waveFinished = await waitForActions(sentWaveActions, 70000);
+            if (!waveFinished) {
+              safeSend(dashboardClient, {type: "log", index: 0, message: `Kick wave target ${target} belum seluruhnya selesai setelah timeout; lanjut ke target berikutnya untuk menghindari antrean macet.`});
+            }
+            completed = Math.min(total, completed + sentWaveActions.filter(action =>
+              accounts.some(a => a.completedKickActions.has(action))
+            ).length);
+          }
+
+          safeSend(dashboardClient, {
+            type: "kickQueue.progress",
+            done: Math.min(total, actionNo),
+            completed,
+            total,
+            sent,
+            skipped,
+            loop,
+            targetIndex: targetIndex + 1,
+            target,
+            source,
+            mode: "sequential-target-waves"
+          });
         }
 
-        safeSend(dashboardClient, {
-          type: "kickQueue.progress",
-          done: actionNo,
-          total,
-          sent,
-          skipped,
-          loop,
-          source,
-          mode: "joined-accounts-wave"
-        });
-
-        if (loop < loopCount && loopDelayMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, loopDelayMs));
-        }
+        if (loop < loopCount && loopDelayMs > 0) await sleep(loopDelayMs);
       }
     } catch (err) {
-      safeSend(dashboardClient, {
-        type: "kickQueue.error",
-        total,
-        done: actionNo,
-        sent,
-        skipped,
-        source,
-        message: err?.message || String(err)
-      });
       commandQueueRunning = false;
+      safeSend(dashboardClient, {type: "kickQueue.error", total, done: actionNo, sent, skipped, source, message: err?.message || String(err)});
       return {started: true, sent, skipped, total, error: err?.message || String(err)};
     }
 
@@ -1280,12 +1311,13 @@ wss.on("connection", dashboard => {
       type: "kickQueue.done",
       total,
       done: actionNo,
+      completed,
       sent,
       skipped,
       source,
-      mode: "joined-accounts-wave",
+      mode: "sequential-target-waves",
       dispatched: true,
-      note: "Selesai mengirim vote-kick. Hasil akhir tiap job tetap mengikuti job.get/job status API."
+      note: "Setiap target diproses sebagai wave terpisah dan wave berikutnya baru dikirim setelah job target sebelumnya mencapai status terminal atau timeout."
     });
     return {started: true, sent, skipped, total};
   }
