@@ -4,17 +4,6 @@ const WebSocket = require("ws");
 const PORT = Number(process.env.PORT || 3000);
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || "";
 const MIG_WS_URL = process.env.MIG_WS_URL || "wss://developer.mig33.id/developer/ws";
-// The Android app starts its auto-kick flow from the room caption emitted
-// when a vote-kick is opened, not from room.kick.queued (which is our own
-// command acknowledgement). The sender check below is intentional: only the
-// room/system message may arm the countdown.
-const VOTE_KICK_TEXT_RE = /\ba\s*vote\s+to\s+kick\b/i;
-const ROOM_TEXT_EVENT_TYPES = new Set([
-  "room.text",
-  "room.text.received",
-  "room.message.received",
-  "room.message"
-]);
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
   if (req.method !== "GET") {
@@ -281,236 +270,6 @@ function isTerminalJobStatus(status) {
   ].includes(status);
 }
 
-function eventRoom(data) {
-  const payload = responsePayload(data);
-  const candidates = [
-    data?.room,
-    data?.room_name,
-    data?.roomName,
-    data?.room_id,
-    data?.roomId,
-    data?.record?.room,
-    data?.record?.room_name,
-    data?.record?.roomName,
-    data?.record?.room_id,
-    data?.record?.roomId,
-    data?.data?.room,
-    data?.data?.room_name,
-    data?.data?.roomName,
-    data?.data?.room_id,
-    data?.data?.roomId,
-    data?.data?.record?.room,
-    data?.data?.record?.room_name,
-    data?.data?.record?.roomName,
-    data?.data?.record?.room_id,
-    data?.data?.record?.roomId,
-    data?.result?.room,
-    data?.result?.room_name,
-    data?.result?.roomName,
-    data?.result?.room_id,
-    data?.result?.roomId,
-    data?.result?.record?.room,
-    data?.result?.record?.room_name,
-    data?.result?.record?.roomName,
-    data?.result?.record?.room_id,
-    data?.result?.record?.roomId,
-    payload?.room,
-    payload?.room_name,
-    payload?.roomName,
-    payload?.room_id,
-    payload?.roomId,
-    payload?.record?.room
-  ];
-  return candidates.find(value => typeof value === "string" && value.trim())?.trim() || "";
-}
-
-function roomTextCandidates(data) {
-  const values = [];
-  const seen = new Set();
-  const add = value => {
-    if (typeof value !== "string" || !value.trim() || seen.has(value)) return;
-    seen.add(value);
-    values.push(value.trim());
-  };
-  const walk = (node, depth = 0) => {
-    if (node == null || depth > 8) return;
-    if (Array.isArray(node)) {
-      node.forEach(item => walk(item, depth + 1));
-      return;
-    }
-    if (typeof node !== "object") return;
-    for (const key of [
-      "message",
-      "text",
-      "content",
-      "body",
-      "caption",
-      "msg",
-      "room_message",
-      "roomMessage",
-      "chat_message",
-      "chatMessage"
-    ]) {
-      add(node[key]);
-    }
-    for (const key of [
-      "record",
-      "data",
-      "result",
-      "event",
-      "payload",
-      "message",
-      "message_data",
-      "messageData"
-    ]) {
-      if (node[key] && typeof node[key] === "object") walk(node[key], depth + 1);
-    }
-  };
-  walk(data);
-  return values;
-}
-
-function roomSenderCandidates(data) {
-  const values = [];
-  const seen = new Set();
-  const add = value => {
-    if (typeof value !== "string") return;
-    const normalized = value.trim();
-    if (!normalized || seen.has(normalized)) return;
-    seen.add(normalized);
-    values.push(normalized);
-  };
-
-  const walk = (node, depth = 0) => {
-    if (node == null || depth > 8) return;
-    if (Array.isArray(node)) {
-      node.forEach(item => walk(item, depth + 1));
-      return;
-    }
-    if (typeof node !== "object") return;
-
-    for (const key of [
-      "sender",
-      "from",
-      "author",
-      "source",
-      "origin",
-      "actor",
-      "created_by",
-      "createdBy",
-      "sender_type",
-      "senderType",
-      "sender_name",
-      "senderName",
-      "from_type",
-      "fromType",
-      "source_type",
-      "sourceType"
-    ]) {
-      const sender = node[key];
-      if (typeof sender === "string") {
-        add(sender);
-      } else if (sender && typeof sender === "object") {
-        for (const nameKey of [
-          "type",
-          "name",
-          "username",
-          "user_name",
-          "userName",
-          "display_name",
-          "displayName",
-          "role",
-          "id",
-          "kind",
-          "category",
-          "sender_type",
-          "senderType",
-          "entity_type",
-          "entityType"
-        ]) {
-          add(sender[nameKey]);
-        }
-        walk(sender, depth + 1);
-      }
-    }
-
-    for (const key of ["record", "data", "result", "event", "payload", "message"]) {
-      if (node[key] && typeof node[key] === "object") {
-        walk(node[key], depth + 1);
-      }
-    }
-  };
-
-  walk(data);
-  return values;
-}
-
-function isRoomSender(data, room) {
-  const roomName = String(room || "").trim().toLowerCase();
-  const senderCandidates = roomSenderCandidates(data);
-  const explicitSender = senderCandidates.some(sender => {
-    const normalized = sender.toLowerCase();
-    return (
-      normalized === "room" ||
-      (roomName && normalized === roomName) ||
-      (roomName && normalized === `room:${roomName}`) ||
-      (roomName && normalized === `room/${roomName}`)
-    );
-  });
-  if (explicitSender) return true;
-  if (senderCandidates.length) return false;
-
-  // Mig33's live room.text event identifies its origin in the event type
-  // and may omit a sender field entirely. This is still an explicit room
-  // source, unlike a generic message event without sender metadata.
-  return ROOM_TEXT_EVENT_TYPES.has(String(data?.type || "").trim().toLowerCase());
-}
-
-function voteKickTarget(text) {
-  const match = /\ba\s*vote\s+to\s+kick\s+(.+?)(?:\s+has\s+been\s+started\s+by\b|[.!?]|$)/i.exec(text);
-  return String(match?.[1] || "").trim();
-}
-
-function voteKickStartedBy(text) {
-  const match = /\bhas\s+been\s+started\s+by\s+(.+?)(?:,|\.|$)/i.exec(text);
-  return String(match?.[1] || "").trim();
-}
-
-function detectVoteKickTimer(data) {
-  const type = String(data?.type || "").toLowerCase();
-
-  const room = eventRoom(data);
-  if (!room || !isRoomSender(data, room)) return null;
-
-  for (const text of roomTextCandidates(data)) {
-    if (!VOTE_KICK_TEXT_RE.test(text)) continue;
-    const payload = responsePayload(data);
-    return {
-      room,
-      targetUsername: voteKickTarget(text),
-      startedBy: voteKickStartedBy(text),
-      sender: "room",
-      message: text,
-      eventId: String(
-        data?.event_id ||
-        data?.eventId ||
-        data?.message_id ||
-        data?.messageId ||
-        data?.data?.event_id ||
-        data?.data?.eventId ||
-        data?.data?.message_id ||
-        data?.data?.messageId ||
-        payload?.event_id ||
-        payload?.eventId ||
-        payload?.message_id ||
-        payload?.messageId ||
-        ""
-      ).trim()
-    };
-  }
-  return null;
-}
-
 function clampDelayMs(value, fallback = 0) {
   const parsed = Number(value);
   const resolved = Number.isFinite(parsed) ? parsed : fallback;
@@ -550,7 +309,6 @@ function accountState() {
     ready: false,
     joined: new Set(),
     requestedRooms: new Set(),
-    subscribedRooms: new Set(),
     pendingJoinRoom: "",
     pingTimer: null,
     lastHeartbeatAt: 0,
@@ -558,8 +316,6 @@ function accountState() {
     pendingJobs: new Map(),
     pendingKickDispatches: [],
     outboundScheduler: null,
-    reconnectTimer: null,
-    reconnectAttempt: 0,
     authTimer: null,
     authFailed: false,
     manuallyClosed: false
@@ -632,41 +388,25 @@ wss.on("connection", dashboard => {
     );
   }
 
-  function beginAutoKickCountdown(index, detection, source = "detected") {
-    const detectedRoom = detection.room;
+  function beginAutoKickCountdown(index, detection, source = "manual") {
+    const detectedRoom = String(detection?.room || "").trim();
     if (autoKick.countdownEndAt) return;
 
     autoKick.countdownEndAt = Date.now() + 60000;
     autoKick.countdownTriggered = false;
-    autoKick.source = source;
-    if (source === "detected") {
-      safeSend(dashboard, {
-        type: "autoKick.detected",
-        index,
-        room: detectedRoom,
-        targetUsername: detection.targetUsername,
-        startedBy: detection.startedBy,
-        eventId: detection.eventId,
-        message: detection.message,
-        countdownMs: autoKick.countdownMs,
-        thresholdMs: autoKick.thresholdMs
-      });
-    } else {
-      safeSend(dashboard, {
-        type: "autoKick.manual.started",
-        room: detectedRoom,
-        countdownMs: autoKick.countdownMs,
-        thresholdMs: autoKick.thresholdMs
-      });
-    }
+    autoKick.source = "manual";
+    safeSend(dashboard, {
+      type: "autoKick.manual.started",
+      room: detectedRoom,
+      countdownMs: autoKick.countdownMs,
+      thresholdMs: autoKick.thresholdMs
+    });
     safeSend(dashboard, {
       type: "log",
-      index,
-      message: source === "detected"
-        ? `Deteksi vote-kick di room ${detectedRoom}: target ${detection.targetUsername}. Countdown auto kick dimulai dari ${autoKick.countdownMs} ms.`
-        : `Timer auto kick dimulai manual untuk room ${detectedRoom} dari ${autoKick.countdownMs} ms.`
+      index: 0,
+      message: `Timer auto kick dimulai manual untuk room ${detectedRoom} dari ${autoKick.countdownMs} ms.`
     });
-    autoKickState("countdown", {source});
+    autoKickState("countdown", {source: "manual"});
 
     autoKick.countdownInterval = setInterval(() => {
       const remainingMs = Math.max(0, autoKick.countdownEndAt - Date.now());
@@ -704,7 +444,8 @@ wss.on("connection", dashboard => {
             {
               socketDelayMs: autoKick.socketDelayMs,
               sequentialMode: autoKick.sequentialMode,
-              targetDelaysMs: autoKick.targetDelaysMs
+              targetDelaysMs: autoKick.targetDelaysMs,
+              batchDelayMs: autoKick.delayMs
             }
           ).finally(() => {
             if (autoKick.countdownEndAt) {
@@ -731,14 +472,6 @@ wss.on("connection", dashboard => {
       }
     }, 100);
     return true;
-  }
-
-  function startAutoKickCountdown(index, data) {
-    const detection = detectVoteKickTimer(data);
-    if (!detection) return false;
-    if (!autoKick.enabled || !autoKick.room) return false;
-    if (!roomMatches(detection.room, autoKick.room)) return false;
-    return beginAutoKickCountdown(index, detection, "detected");
   }
 
   function startManualAutoKickCountdown() {
@@ -891,103 +624,18 @@ wss.on("connection", dashboard => {
         safeSend(dashboard, {
           type: "log",
           index: i,
-          message: "PING timeout; socket ditutup agar relogin otomatis berjalan"
+          message: "PING timeout; socket ditutup"
         });
         try { a.ws.terminate(); } catch {}
         return;
       }
-      try { a.ws.ping(); } catch {}
       enqueueOutbound(i, {type: "ping"}, {priority: true});
       safeSend(dashboard, {type: "log", index: i, message: "PING keep-alive dikirim"});
     }, 50000);
   }
 
-  function clearReconnect(i) {
-    const a = accounts[i];
-    if (a.reconnectTimer) clearTimeout(a.reconnectTimer);
-    a.reconnectTimer = null;
-  }
-
-  function closeAccount(i, manual = true) {
-    const a = accounts[i];
-    // Mark manual logout BEFORE touching the socket so the close handler
-    // can never schedule an automatic reconnect.
-    a.manuallyClosed = manual;
-    clearReconnect(i);
-    stopPing(i);
-    stopJobPolling(i);
-    stopOutbound(i);
-    if (a.authTimer) clearTimeout(a.authTimer);
-    a.authTimer = null;
-    a.ready = false;
-    a.authFailed = false;
-    a.joined.clear();
-    a.requestedRooms.clear();
-    a.subscribedRooms.clear();
-    a.pendingJoinRoom = "";
-    const ws = a.ws;
-    // Detach first so a late close event from the old socket cannot change
-    // the account back to ERROR/ONLINE or trigger reconnect logic.
-    a.ws = null;
-    if (ws) {
-      try {
-        // MigReborn Developer API has no separate logout/disconnect command.
-        // A clean WebSocket close is the protocol-level disconnect.
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.close(1000, "logout");
-        } else if (ws.readyState === WebSocket.CONNECTING) {
-          ws.close(1000, "logout");
-        }
-      } catch {}
-      // Fallback only if the socket refuses to close cleanly.
-      try {
-        if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
-      } catch {}
-    }
-    dashboardStatus(i, "offline");
-  }
-
-  function scheduleReconnect(i) {
-    const a = accounts[i];
-    if (a.manuallyClosed || a.authFailed || !a.username || !a.password) return;
-    clearReconnect(i);
-    const delayMs = Math.min(15000, Math.round(2000 * Math.pow(1.5, Math.min(a.reconnectAttempt, 5))));
-    a.reconnectAttempt += 1;
-    safeSend(dashboard, {
-      type: "log",
-      index: i,
-      message: `RELOGIN otomatis dalam ${delayMs} ms (percobaan ${a.reconnectAttempt})`
-    });
-    a.reconnectTimer = setTimeout(() => connectAccount(i), delayMs);
-  }
-
-  function rejoinRequestedRooms(i) {
-    const a = accounts[i];
-    const rooms = [...a.requestedRooms].filter(room => !hasJoinedRoom(a, room));
-    rooms.forEach((room, roomIndex) => {
-      setTimeout(() => {
-        if (
-          !a.ready ||
-          !a.ws ||
-          a.ws.readyState !== WebSocket.OPEN ||
-          hasJoinedRoom(a, room)
-        ) return;
-
-        a.pendingJoinRoom = room;
-        safeSend(dashboard, {
-          type: "log",
-          index: i,
-          message: `REJOIN ${room} dikirim setelah koneksi pulih`
-        });
-        a.ws.send(JSON.stringify({type: "room.join", room}));
-      }, 0);
-    });
-  }
-
   function connectAccount(i, options = {}) {
     const a = accounts[i];
-    if (options.resetBackoff) a.reconnectAttempt = 0;
-    clearReconnect(i);
     stopPing(i);
     stopJobPolling(i);
     stopOutbound(i);
@@ -997,7 +645,6 @@ wss.on("connection", dashboard => {
     a.manuallyClosed = false;
     a.ready = false;
     a.joined.clear();
-    a.subscribedRooms.clear();
     a.pendingJoinRoom = "";
 
     if (!a.username || !a.password) {
@@ -1053,24 +700,6 @@ wss.on("connection", dashboard => {
         if (!users.length) safeSend(dashboard, {type: "log", index: i, message: `Participants raw: ${JSON.stringify(data).slice(0, 8000)}`});
       }
 
-      const voteKickDetection = detectVoteKickTimer(data);
-      if (voteKickDetection) {
-        const started = startAutoKickCountdown(i, data);
-        if (!started) {
-          safeSend(dashboard, {
-            type: "log",
-            index: i,
-            message: `Vote-kick terdeteksi tetapi timer tidak di-arm: room=${voteKickDetection.room}, konfigurasi room=${autoKick.room || "-"}.`
-          });
-        }
-      } else if (roomTextCandidates(data).some(text => VOTE_KICK_TEXT_RE.test(text))) {
-        safeSend(dashboard, {
-          type: "log",
-          index: i,
-          message: `Kandidat vote-kick diterima tetapi sender bukan room: room=${eventRoom(data) || "-"}, sender=${roomSenderCandidates(data).join(", ") || "-"}.`
-        });
-      }
-
       if (data.type === "auth.required") {
         // Once session.ready has been received, a late/duplicate auth.required
         // must never downgrade a successful account back to AUTH.
@@ -1101,7 +730,6 @@ wss.on("connection", dashboard => {
         a.authTimer = null;
         a.ready = true;
         a.authFailed = false;
-        a.reconnectAttempt = 0;
         a.lastHeartbeatAt = Date.now();
         const permissions =
           data?.data?.developer?.permissions ||
@@ -1127,7 +755,6 @@ wss.on("connection", dashboard => {
         }
 
         startPing(i);
-        rejoinRequestedRooms(i);
         return;
       }
 
@@ -1160,7 +787,7 @@ wss.on("connection", dashboard => {
         a.pendingJoinRoom = "";
         stopPing(i);
         dashboardStatus(i, "error", {message: "Session replaced"});
-      try { ws.close(4001, "session replaced"); } catch { scheduleReconnect(i); }
+      try { ws.close(4001, "session replaced"); } catch {}
       }
 
       if (data.type === "room.join.result") {
@@ -1191,7 +818,6 @@ wss.on("connection", dashboard => {
           // room.join.result confirms room membership only; it must never be
           // used as the login-status signal. session.ready is authoritative.
           safeSend(dashboard, {type: "log", index: i, message: `JOIN BERHASIL: ${joinedRoom}`});
-          subscribeRoomText(i, joinedRoom);
         } else {
           safeSend(dashboard, {
             type: "log",
@@ -1215,7 +841,6 @@ wss.on("connection", dashboard => {
           for (const requestedRoom of a.requestedRooms) {
             if (roomMatches(requestedRoom, leftRoom)) a.requestedRooms.delete(requestedRoom);
           }
-          unsubscribeRoomText(i, leftRoom);
           if (roomMatches(a.pendingJoinRoom, leftRoom)) a.pendingJoinRoom = "";
         }
       }
@@ -1264,7 +889,6 @@ wss.on("connection", dashboard => {
         message: `CLOSED code=${code} reason=${reason}`
       });
 
-      if (!wasAuthFailure) scheduleReconnect(i);
     });
   }
 
@@ -1333,27 +957,6 @@ wss.on("connection", dashboard => {
     return accepted;
   }
 
-  function subscribeRoomText(i, room) {
-    const name = String(room || "").trim();
-    const a = accounts[i];
-    if (!name || a.subscribedRooms.has(name)) return false;
-    a.subscribedRooms.add(name);
-    safeSend(dashboard, {
-      type: "log",
-      index: i,
-      message: `Listener room.text aktif setelah JOIN untuk ${name}`
-    });
-    return true;
-  }
-
-  function unsubscribeRoomText(i, room) {
-    const name = String(room || "").trim();
-    const a = accounts[i];
-    if (!name || !a.subscribedRooms.has(name)) return false;
-    a.subscribedRooms.delete(name);
-    return true;
-  }
-
   async function runKickQueue(room, targets, delayMs, loopCount, source = "kickAll", options = {}) {
     if (!room || !targets.length) return {started: false, sent: 0, skipped: 0, total: 0};
     if (commandQueueRunning) {
@@ -1405,10 +1008,14 @@ wss.on("connection", dashboard => {
         for (let n = 0; n < 10; n++) {
           actionNo++;
           const account = accounts[n];
+          // Mig33 API defines room.kick as the vote-kick command itself.
+          // The API documentation does not require this developer socket to
+          // have a locally-confirmed room.join before sending room.kick.
+          // Require only an authenticated/open socket; the API remains the
+          // authority for permission and room/target validity.
           const canKick =
             account.ready &&
-            account.ws?.readyState === WebSocket.OPEN &&
-            hasJoinedRoom(account, room);
+            account.ws?.readyState === WebSocket.OPEN;
           const didSend = canKick && sendKickToAccount(n, {
             type: "room.kick",
             room,
@@ -1422,7 +1029,7 @@ wss.on("connection", dashboard => {
             safeSend(dashboard, {
               type: "log",
               index: n,
-              message: `KICK dilewati: ID #${n + 1} belum siap atau belum terkonfirmasi masuk room ${room}`
+              message: `KICK dilewati: ID #${n + 1} belum siap atau WebSocket belum OPEN`
             });
           }
 
@@ -1666,6 +1273,7 @@ wss.on("connection", dashboard => {
         : [];
       autoKick.loopCount = Math.max(1, Math.min(100, Number(msg.loopCount) || 1));
       autoKick.socketDelayMs = Math.max(0, Math.min(60000, Number(msg.socketDelayMs) || 0));
+      autoKick.delayMs = clampDelayMs(msg.delayMs);
       autoKick.sequentialMode = msg.sequentialMode === true;
       if (!autoKick.enabled) stopAutoKickCountdown("disabled");
       else autoKickState(autoKick.countdownEndAt ? "countdown" : "armed");
@@ -1754,7 +1362,5 @@ if (require.main === module) {
 
 module.exports = {
   createOutboundScheduler,
-  buildKickSequence,
-  detectVoteKickTimer,
-  isRoomSender
+  buildKickSequence
 };

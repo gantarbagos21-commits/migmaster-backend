@@ -1,17 +1,12 @@
 {
-  "name": "migmaster-backend",
-  "version": "1.0.0",
+  "name": "migmaster-vercel",
+  "version": "1.0.1",
   "private": true,
-  "description": "MigMaster WebSocket backend bridge for MigReborn Developer API",
-  "main": "server.js",
+  "main": "api/index.js",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "build": "node -e \"console.log('MigMaster Vercel Node build OK')\""
   },
   "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
+    "node": ">=18"
   }
 }
