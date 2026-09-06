@@ -337,6 +337,7 @@ wss.on("connection", dashboard => {
 
   const accounts = Array.from({length: 10}, accountState);
   let commandQueueRunning = false;
+  const kickQueueBatches = new Map();
   const autoKick = {
     enabled: false,
     room: "",
@@ -444,8 +445,7 @@ wss.on("connection", dashboard => {
             {
               socketDelayMs: autoKick.socketDelayMs,
               sequentialMode: autoKick.sequentialMode,
-              targetDelaysMs: autoKick.targetDelaysMs,
-              batchDelayMs: autoKick.delayMs
+              loopDelayMs: autoKick.delayMs
             }
           ).finally(() => {
             if (autoKick.countdownEndAt) {
@@ -556,6 +556,7 @@ wss.on("connection", dashboard => {
       room: pendingKick?.room || payload?.room || data?.room || "",
       target: pendingKick?.target || payload?.target_username || data?.target_username || "",
       kickQueueId: pendingKick?.kickQueueId || "",
+      batchKey: pendingKick?.batchKey || "",
       attempts: 0
     });
     safeSend(dashboard, {
@@ -598,6 +599,7 @@ wss.on("connection", dashboard => {
         success: ok,
         error: ok ? "" : responseError(data)
       });
+      if (job.batchKey) markKickBatchComplete(job.batchKey);
     }
 
     const payload = responsePayload(data);
@@ -942,19 +944,59 @@ wss.on("connection", dashboard => {
     return true;
   }
 
-  function sendKickToAccount(i, payload, kickQueueId = "") {
+  function sendKickToAccount(i, payload, kickQueueId = "", batchKey = "") {
     const accepted = enqueueOutbound(i, payload, {spacingMs: 0});
     if (accepted) {
       // room.kick returns its job_id asynchronously. Keep the local request
       // context in the same per-account send order so the official queued
-      // response can be associated with room/target without guessing.
+      // response can be associated with the exact queue batch.
       accounts[i].pendingKickDispatches.push({
         room: String(payload?.room || ""),
         target: String(payload?.target_username || ""),
-        kickQueueId: String(kickQueueId || "")
+        kickQueueId: String(kickQueueId || ""),
+        batchKey: String(batchKey || "")
       });
     }
     return accepted;
+  }
+
+  function createKickBatch(kickQueueId, loop, targetIndex, target) {
+    const key = `${kickQueueId}:${loop}:${targetIndex}`;
+    let resolveBatch;
+    const promise = new Promise(resolve => { resolveBatch = resolve; });
+    const batch = {
+      key, kickQueueId, loop, targetIndex, target, expected: 0, completed: 0,
+      results: 0, promise, resolve: resolveBatch, timer: null
+    };
+    kickQueueBatches.set(key, batch);
+    return batch;
+  }
+
+  function markKickBatchComplete(batchKey) {
+    const batch = kickQueueBatches.get(batchKey);
+    if (!batch) return;
+    batch.completed += 1;
+    if (batch.completed >= batch.expected) {
+      if (batch.timer) clearTimeout(batch.timer);
+      kickQueueBatches.delete(batchKey);
+      batch.resolve({completed: batch.completed, expected: batch.expected, timedOut: false});
+    }
+  }
+
+  function finishEmptyKickBatch(batch) {
+    if (!batch || batch.expected) return;
+    kickQueueBatches.delete(batch.key);
+    batch.resolve({completed: 0, expected: 0, timedOut: false});
+  }
+
+  function waitForKickBatch(batch, timeoutMs = 65000) {
+    if (!batch.expected) { finishEmptyKickBatch(batch); return batch.promise; }
+    batch.timer = setTimeout(() => {
+      if (!kickQueueBatches.has(batch.key)) return;
+      kickQueueBatches.delete(batch.key);
+      batch.resolve({completed: batch.completed, expected: batch.expected, timedOut: true});
+    }, timeoutMs);
+    return batch.promise;
   }
 
   async function runKickQueue(room, targets, delayMs, loopCount, source = "kickAll", options = {}) {
@@ -969,19 +1011,16 @@ wss.on("connection", dashboard => {
     }
 
     const total = targets.length * 10 * loopCount;
-    const targetDelaysMs = normalizeTargetDelays(
-      targets,
-      options.targetDelaysMs,
-      options.batchDelayMs ?? delayMs
-    );
+    const loopDelayMs = clampDelayMs(options.loopDelayMs ?? options.batchDelayMs ?? delayMs);
     const socketDelayMs = Math.max(0, Math.min(60000, Number(options.socketDelayMs) || 0));
     const sequentialMode = options.sequentialMode === true;
     const kickQueueId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
     safeSend(dashboard, {
       type: "kickQueue.start",
       room,
       targets,
-      targetDelaysMs,
+      loopDelayMs,
       socketDelayMs,
       sequentialMode,
       loopCount,
@@ -994,101 +1033,76 @@ wss.on("connection", dashboard => {
     let actionNo = 0;
     let sent = 0;
     let skipped = 0;
-    safeSend(dashboard, {
-      type: "kickQueue.progress",
-      done: 0,
-      total,
-      sent: 0,
-      skipped: 0,
-      source
-    });
+
+    safeSend(dashboard, {type: "kickQueue.progress", done: 0, total, sent: 0, skipped: 0, source});
+
     try {
-      for (const step of buildKickSequence(targets, loopCount, targetDelaysMs)) {
-        const {loop, targetIndex, target, delayMs: targetDelayMs} = step;
-        for (let n = 0; n < 10; n++) {
-          actionNo++;
-          const account = accounts[n];
-          // Mig33 API defines room.kick as the vote-kick command itself.
-          // The API documentation does not require this developer socket to
-          // have a locally-confirmed room.join before sending room.kick.
-          // Require only an authenticated/open socket; the API remains the
-          // authority for permission and room/target validity.
-          const canKick =
-            account.ready &&
-            account.ws?.readyState === WebSocket.OPEN;
-          const didSend = canKick && sendKickToAccount(n, {
-            type: "room.kick",
-            room,
-            target_username: target
-          }, kickQueueId);
+      for (let loop = 1; loop <= loopCount; loop++) {
+        for (let targetIndex = 0; targetIndex < targets.length; targetIndex++) {
+          const target = targets[targetIndex];
+          const batch = createKickBatch(kickQueueId, loop, targetIndex + 1, target);
 
-          if (didSend) {
-            sent++;
-          } else {
-            skipped++;
-            safeSend(dashboard, {
-              type: "log",
-              index: n,
-              message: `KICK dilewati: ID #${n + 1} belum siap atau WebSocket belum OPEN`
-            });
-          }
+          // Each target gets a complete 10-account vote-kick batch before the
+          // next target is started. Completion is based only on terminal
+          // job.get/job.status responses from the official API.
+          for (let n = 0; n < 10; n++) {
+            actionNo++;
+            const account = accounts[n];
+            const canKick = account.ready && account.ws?.readyState === WebSocket.OPEN;
+            const didSend = canKick && sendKickToAccount(n, {
+              type: "room.kick",
+              room,
+              target_username: target
+            }, kickQueueId, batch.key);
 
-          safeSend(dashboard, {
-            type: "kickQueue.step",
-            loop,
-            targetIndex: targetIndex + 1,
-            target,
-            accountIndex: n + 1,
-            delayMs: targetDelayMs,
-            actionNo,
-            total,
-            sent: didSend,
-            status: didSend ? "queued" : "skipped"
-          });
-          safeSend(dashboard, {
-            type: "kickQueue.progress",
-            done: actionNo,
-            total,
-            sent,
-            skipped,
-            loop,
-            targetIndex: targetIndex + 1,
-            source
-          });
-
-          if (sequentialMode && n < 9) {
-            if (socketDelayMs > 0) {
-              await new Promise(resolve => setTimeout(resolve, socketDelayMs));
+            if (didSend) {
+              sent++;
+              batch.expected++;
             } else {
-              await new Promise(resolve => setImmediate(resolve));
+              skipped++;
+              safeSend(dashboard, {
+                type: "log", index: n,
+                message: `KICK dilewati: ID #${n + 1} belum siap atau WebSocket belum OPEN`
+              });
+            }
+
+            safeSend(dashboard, {
+              type: "kickQueue.step", loop, targetIndex: targetIndex + 1, target,
+              accountIndex: n + 1, delayMs: loopDelayMs, actionNo, total,
+              sent: didSend, status: didSend ? "queued" : "skipped"
+            });
+            safeSend(dashboard, {
+              type: "kickQueue.progress", done: actionNo, total, sent, skipped,
+              loop, targetIndex: targetIndex + 1, source
+            });
+
+            if (sequentialMode && n < 9) {
+              await new Promise(resolve => setTimeout(resolve, socketDelayMs));
             }
           }
+
+          const result = await waitForKickBatch(batch);
+          if (result.timedOut) {
+            safeSend(dashboard, {
+              type: "log", index: 0,
+              message: `TARGET ${target} loop ${loop}: menunggu job selesai melewati batas waktu (${result.completed}/${result.expected}).`
+            });
+          }
         }
-        if (targetDelayMs > 0) {
-          await new Promise(resolve => setTimeout(resolve, targetDelayMs));
-        } else {
-          await new Promise(resolve => setImmediate(resolve));
+
+        // The existing Delay textbox is used as the delay BEFORE the next
+        // loop. There is no extra delay setting introduced.
+        if (loop < loopCount && loopDelayMs > 0) {
+          safeSend(dashboard, {
+            type: "log", index: 0,
+            message: `Loop ${loop} selesai. Menunggu ${loopDelayMs} ms sebelum loop ${loop + 1}.`
+          });
+          await new Promise(resolve => setTimeout(resolve, loopDelayMs));
         }
       }
     } catch (err) {
-      safeSend(dashboard, {
-        type: "kickQueue.error",
-        total,
-        done: actionNo,
-        sent,
-        skipped,
-        source,
-        message: err?.message || String(err)
-      });
-      safeSend(dashboard, {
-        type: "kickQueue.done",
-        total,
-        done: actionNo,
-        sent,
-        skipped,
-        source,
-        error: true
-      });
+      safeSend(dashboard, {type: "kickQueue.error", total, done: actionNo, sent, skipped, source, message: err?.message || String(err)});
+      safeSend(dashboard, {type: "kickQueue.done", total, done: actionNo, sent, skipped, source, error: true});
       return {started: true, sent, skipped, total, error: err?.message || String(err)};
     } finally {
       commandQueueRunning = false;
@@ -1316,9 +1330,6 @@ wss.on("connection", dashboard => {
         ? [...new Set(msg.targets.map(v => String(v || "").trim()).filter(Boolean))].slice(0, 10)
         : [];
       const delayMs = clampDelayMs(msg.delayMs);
-      const targetDelaysMs = Array.isArray(msg.targetDelaysMs)
-        ? msg.targetDelaysMs.slice(0, targets.length).map(value => clampDelayMs(value))
-        : [];
       const loopCount = Math.max(1, Math.min(100, Number(msg.loopCount) || 1));
       const socketDelayMs = Math.max(0, Math.min(60000, Number(msg.socketDelayMs) || 0));
       const sequentialMode = msg.sequentialMode === true;
@@ -1327,7 +1338,7 @@ wss.on("connection", dashboard => {
       runKickQueue(room, targets, delayMs, loopCount, "kickAll", {
         socketDelayMs,
         sequentialMode,
-        targetDelaysMs
+        loopDelayMs: delayMs
       });
       return;
     }
