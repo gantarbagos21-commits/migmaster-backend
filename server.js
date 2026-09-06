@@ -295,7 +295,8 @@ function accountState() {
     outboundScheduler: null,
     authTimer: null,
     authFailed: false,
-    manuallyClosed: false
+    manuallyClosed: false,
+    lastRoomCommand: null
   };
 }
 
@@ -329,10 +330,34 @@ wss.on("connection", dashboard => {
     countdownInterval: null,
     countdownTriggered: false
   };
-  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "kick-authoritative-job-results-2026-09-06-v1"});
+  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "kick-authoritative-room-audit-2026-09-06-v1"});
 
   function dashboardStatus(i, status, extra = {}) {
     safeSend(dashboard, {type: "status", index: i, status, ...extra});
+  }
+
+  // Room audit: record only commands/events actually observed by this client.
+  // This does not infer undocumented server behaviour.
+  function auditRoom(i, direction, type, room, extra = {}) {
+    const a = accounts[i];
+    const entry = {
+      at: new Date().toISOString(),
+      direction,
+      type,
+      room: String(room || ""),
+      ...extra
+    };
+    a.lastRoomCommand = entry;
+    safeSend(dashboard, {
+      type: "room.audit",
+      index: i,
+      audit: entry
+    });
+    safeSend(dashboard, {
+      type: "log",
+      index: i,
+      message: `[ROOM AUDIT] ${direction} ${type}${room ? ` room=${room}` : ""}${extra.target ? ` target=${extra.target}` : ""}${extra.code != null ? ` code=${extra.code}` : ""}${extra.reason ? ` reason=${extra.reason}` : ""}`
+    });
   }
 
   function autoKickState(status = "idle", extra = {}) {
@@ -827,6 +852,7 @@ wss.on("connection", dashboard => {
       }
 
       if (data.type === "session.replaced") {
+        auditRoom(i, "IN", "session.replaced", "", {reason: "logged_in_elsewhere"});
         a.ready = false;
         a.joined.clear();
         a.pendingJoinRoom = "";
@@ -857,6 +883,7 @@ wss.on("connection", dashboard => {
            (!!joinedRoom && !status));
 
         if (ok && joinedRoom) {
+          auditRoom(i, "IN", "room.join.result", joinedRoom, {status: status || "success"});
           a.joined.add(joinedRoom);
           a.requestedRooms.add(joinedRoom);
           a.pendingJoinRoom = "";
@@ -880,6 +907,7 @@ wss.on("connection", dashboard => {
         const status = String(payload?.status ?? payload?.state ?? data?.status ?? "").toLowerCase();
         const failed = !!responseError(data) || ["error", "failed", "failure", "rejected", "denied"].includes(status);
         if (leftRoom && !failed) {
+          auditRoom(i, "IN", "room.leave.result", leftRoom, {status: status || "success"});
           for (const joinedRoom of a.joined) {
             if (roomMatches(joinedRoom, leftRoom)) a.joined.delete(joinedRoom);
           }
@@ -920,6 +948,7 @@ wss.on("connection", dashboard => {
       a.authTimer = null;
       const reason = reasonBuf?.toString() || "-";
       const wasAuthFailure = a.authFailed || reason.includes("authentication failed");
+      auditRoom(i, "SOCKET", "close", "", {code, reason});
       a.ready = false;
       a.ws = null;
 
@@ -984,6 +1013,11 @@ wss.on("connection", dashboard => {
     const a = accounts[i];
     if (!canSendToAccount(i, payload)) return false;
     a.ws.send(JSON.stringify(payload));
+    if (payload?.type === "room.join" || payload?.type === "room.leave" || payload?.type === "room.participants") {
+      auditRoom(i, "OUT", payload.type, payload.room, {
+        source: payload.type === "room.leave" ? "leaveAll" : payload.type === "room.join" ? "joinAll" : "participants"
+      });
+    }
     return true;
   }
 
@@ -999,6 +1033,7 @@ wss.on("connection", dashboard => {
       // Kick requests deliberately bypass the normal outbound scheduler.
       // One wave is the complete 10-ID x 10-target matrix.
       a.ws.send(JSON.stringify(payload));
+      auditRoom(i, "OUT", "room.kick", payload.room, {target: payload.target_username, source: "kickQueue"});
       return true;
     } catch {
       a.pendingKickDispatches.pop();
@@ -1153,6 +1188,7 @@ wss.on("connection", dashboard => {
   async function joinAll(room) {
     const name = String(room || "").trim();
     if (!name) return;
+    safeSend(dashboard, {type: "log", index: 0, message: `[ROOM AUDIT] JOIN ALL room=${name}`});
     for (let i = 0; i < 10; i++) {
       const a = accounts[i];
       if (!a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) continue;
