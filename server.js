@@ -931,9 +931,17 @@ wss.on("connection", dashboard => {
     a.ws = null;
     if (ws) {
       try {
-        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
-          ws.terminate();
+        // MigReborn Developer API has no separate logout/disconnect command.
+        // A clean WebSocket close is the protocol-level disconnect.
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, "logout");
+        } else if (ws.readyState === WebSocket.CONNECTING) {
+          ws.close(1000, "logout");
         }
+      } catch {}
+      // Fallback only if the socket refuses to close cleanly.
+      try {
+        if (ws.readyState !== WebSocket.CLOSED) ws.terminate();
       } catch {}
     }
     dashboardStatus(i, "offline");
@@ -1549,14 +1557,16 @@ wss.on("connection", dashboard => {
     }
 
     if (msg.action === "logoutAll") {
-      // Acknowledge immediately so the UI can never wait for socket close events.
-      safeSend(dashboard, {type: "logout.done"});
+      // Disconnect every account first, then acknowledge the dashboard.
+      // The API has no separate logout command; closing each WebSocket is
+      // the actual protocol-level disconnect.
       for (let n = 0; n < 10; n++) {
         try { closeAccount(n, true); } catch (err) {
           safeSend(dashboard, {type: "log", index: n, message: `Logout cleanup error: ${publicError(err)}`});
           dashboardStatus(n, "offline");
         }
       }
+      safeSend(dashboard, {type: "logout.done"});
       return;
     }
 
