@@ -510,7 +510,7 @@ wss.on("connection", dashboard => {
       }
 
       if (a.pendingJobs.size) scheduleJobPoll(i);
-    }, 500);
+    }, 1000);
   }
 
   function trackQueuedJob(i, data) {
@@ -1073,18 +1073,23 @@ wss.on("connection", dashboard => {
               });
             }
 
-            safeSend(dashboard, {
-              type: "kickQueue.step",
-              loop,
-              targetIndex: targetIndex + 1,
-              target,
-              accountIndex: accountIndex + 1,
-              actionNo,
-              total,
-              sent: didSend,
-              status: didSend ? "sent" : "skipped",
-              mode: "10x10-wave"
-            });
+            // Do not flood the dashboard with 100 individual render events.
+            // The kick request itself is sent immediately; UI progress is emitted
+            // only periodically so rendering cannot become the bottleneck.
+            if (actionNo === 1 || actionNo === total || actionNo % 10 === 0) {
+              safeSend(dashboard, {
+                type: "kickQueue.step",
+                loop,
+                targetIndex: targetIndex + 1,
+                target,
+                accountIndex: accountIndex + 1,
+                actionNo,
+                total,
+                sent: didSend,
+                status: didSend ? "sent" : "skipped",
+                mode: "10x10-wave"
+              });
+            }
           }
         }
 
