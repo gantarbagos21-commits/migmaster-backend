@@ -945,19 +945,27 @@ wss.on("connection", dashboard => {
   }
 
   function sendKickToAccount(i, payload, kickQueueId = "", batchKey = "") {
-    const accepted = enqueueOutbound(i, payload, {spacingMs: 0});
-    if (accepted) {
-      // room.kick returns its job_id asynchronously. Keep the local request
-      // context in the same per-account send order so the official queued
-      // response can be associated with the exact queue batch.
-      accounts[i].pendingKickDispatches.push({
-        room: String(payload?.room || ""),
-        target: String(payload?.target_username || ""),
-        kickQueueId: String(kickQueueId || ""),
-        batchKey: String(batchKey || "")
-      });
+    const a = accounts[i];
+    if (!a || !a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) return false;
+
+    // Kick All uses a true parallel wave: put the context first, then send
+    // directly on each account socket. This avoids the per-account outbound
+    // scheduler serialising the 10 votes. The next target is still held until
+    // the current wave's official job results are terminal.
+    if (!canSendToAccount(i, payload)) return false;
+    a.pendingKickDispatches.push({
+      room: String(payload?.room || ""),
+      target: String(payload?.target_username || ""),
+      kickQueueId: String(kickQueueId || ""),
+      batchKey: String(batchKey || "")
+    });
+    try {
+      a.ws.send(JSON.stringify(payload));
+      return true;
+    } catch {
+      a.pendingKickDispatches.pop();
+      return false;
     }
-    return accepted;
   }
 
   function createKickBatch(kickQueueId, loop, targetIndex, target) {
