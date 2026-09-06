@@ -329,7 +329,7 @@ wss.on("connection", dashboard => {
     countdownInterval: null,
     countdownTriggered: false
   };
-  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "auth-status-balance-fix-2026-09-06-v4"});
+  safeSend(dashboard, {type: "dashboard.ready", accounts: 10, backendVersion: "kick-authoritative-job-results-2026-09-06-v1"});
 
   function dashboardStatus(i, status, extra = {}) {
     safeSend(dashboard, {type: "status", index: i, status, ...extra});
@@ -536,8 +536,17 @@ wss.on("connection", dashboard => {
     safeSend(dashboard, {
       type: "log",
       index: i,
-      message: `JOB ${jobId} diantrikan (${String(data?.type || "command").replace(/\.queued$/, "")})`
+      message: `JOB ${jobId} diantrikan (${String(data?.type || "command").replace(/\.queued$/, "")}) target=${pendingKick?.target || "-"}`
     });
+    if (command === "room.kick") {
+      safeSend(dashboard, {
+        type: "kick.queued",
+        index: i,
+        jobId,
+        room: pendingKick?.room || payload?.room || data?.room || "",
+        target: pendingKick?.target || payload?.target_username || data?.target_username || ""
+      });
+    }
     scheduleJobPoll(i);
   }
 
@@ -713,7 +722,12 @@ wss.on("connection", dashboard => {
       }
       safeSend(dashboard, {type: "api", index: i, data});
       if (String(data?.type || "").endsWith(".queued")) trackQueuedJob(i, data);
-      if (["job.status.result", "job.get.result", "job.status"].includes(data?.type)) {
+      // The API documentation defines job.get by request shape and job fields,
+      // but does not require one single response event name. Only process a
+      // status response when its job_id matches a job this account actually
+      // received from room.kick. This avoids guessing an undocumented event type.
+      const responseJobId = queuedJobId(data);
+      if (responseJobId && accounts[i].pendingJobs.has(responseJobId)) {
         handleJobStatus(i, data);
       }
       if (data.type === "room.participants" || data.type === "room.participants.result") {
