@@ -695,14 +695,14 @@ async function runKickQueue(){
   renderKickProgress();
    const voteDelayMs=Math.max(0,Math.min(60000,Number($('kickVoteDelayMs').value)||0));
    const loopDelayMs=Math.max(0,Math.min(600000,Number($('loopDelayMs').value)||0));
-   if(!send({action:'kickQueue',room,targets,loopCount,loopDelayMs,voteDelayMs,socketDelayMs:voteDelayMs,sequentialMode:false})){
+   if(!send({action:'kickQueue',room,targets,loopCount,delayMs:voteDelayMs,loopDelayMs,voteDelayMs,socketDelayMs:voteDelayMs,sequentialMode:false})){
     $('kickAll').disabled=false;
      $('kickAll').textContent='Kick All';
     kickProgress.running=false;
     renderKickProgress();
     return;
   }
-    log(`Kick All dimulai: ${targets.length} target × ${loopCount} loop, delay antar vote ${voteDelayMs} ms.`);
+    log(`Kick All dimulai: ${targets.length} target × ${loopCount} loop, delay antar vote ${voteDelayMs} ms, delay loop ${loopDelayMs} ms.`);
 }
 
 $('genUsers').onclick=generateUsers;
