@@ -612,6 +612,7 @@ wss.on("connection", dashboard => {
       source: autoKick.source,
       thresholdMs: autoKick.thresholdMs,
       countdownMs: autoKick.countdownMs,
+      deadlineAt: autoKick.countdownEndAt || null,
       remainingMs,
       ...extra
     });
