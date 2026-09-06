@@ -951,7 +951,7 @@ wss.on("connection", dashboard => {
           message: `REJOIN ${room} dikirim setelah koneksi pulih`
         });
         a.ws.send(JSON.stringify({type: "room.join", room}));
-      }, roomIndex * 600);
+      }, 0);
     });
   }
 
@@ -1148,7 +1148,8 @@ wss.on("connection", dashboard => {
           a.joined.add(joinedRoom);
           a.requestedRooms.add(joinedRoom);
           a.pendingJoinRoom = "";
-          dashboardStatus(i, "online", {room: joinedRoom});
+          // room.join.result confirms room membership only; it must never be
+          // used as the login-status signal. session.ready is authoritative.
           safeSend(dashboard, {type: "log", index: i, message: `JOIN BERHASIL: ${joinedRoom}`});
           subscribeRoomText(i, joinedRoom);
         } else {
@@ -1443,7 +1444,8 @@ wss.on("connection", dashboard => {
       const a = accounts[i];
       if (!a.ws || a.ws.readyState !== WebSocket.OPEN || !a.ready) continue;
 
-      dashboardStatus(i, "joining", {room: name});
+      // Login status is independent from room membership.
+      // Do not change ONLINE/SUKSES to AUTH while waiting for room.join.result.
       safeSend(dashboard, {type: "log", index: i, message: `JOIN ${name} dikirim`});
       const didSend = sendToAccount(i, {type: "room.join", room: name});
       if (didSend) {
