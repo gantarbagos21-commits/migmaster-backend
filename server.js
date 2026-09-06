@@ -556,6 +556,7 @@ function accountState() {
     lastHeartbeatAt: 0,
     jobPollTimer: null,
     pendingJobs: new Map(),
+    pendingKickDispatches: [],
     outboundScheduler: null,
     reconnectTimer: null,
     reconnectAttempt: 0,
@@ -774,6 +775,7 @@ wss.on("connection", dashboard => {
     if (a.jobPollTimer) clearTimeout(a.jobPollTimer);
     a.jobPollTimer = null;
     a.pendingJobs.clear();
+    a.pendingKickDispatches.length = 0;
   }
 
   function scheduleJobPoll(i) {
@@ -814,10 +816,13 @@ wss.on("connection", dashboard => {
     }
 
     const payload = responsePayload(data);
+    const command = String(data?.type || "").replace(/\.queued$/, "");
+    const pendingKick = command === "room.kick" ? accounts[i].pendingKickDispatches.shift() : null;
     accounts[i].pendingJobs.set(jobId, {
-      command: String(data?.type || "").replace(/\.queued$/, ""),
-      room: payload?.room || data?.room || "",
-      target: payload?.target_username || data?.target_username || "",
+      command,
+      room: pendingKick?.room || payload?.room || data?.room || "",
+      target: pendingKick?.target || payload?.target_username || data?.target_username || "",
+      kickQueueId: pendingKick?.kickQueueId || "",
       attempts: 0
     });
     safeSend(dashboard, {
@@ -840,11 +845,27 @@ wss.on("connection", dashboard => {
     if (!isTerminalJobStatus(status)) return;
     a.pendingJobs.delete(jobId);
     const ok = ["completed", "complete", "success", "succeeded", "done", "finished"].includes(status);
+    const jobMessage = `JOB ${jobId} ${ok ? "selesai" : `gagal (${status})`}${responseError(data) && !ok ? `: ${responseError(data)}` : ""}`;
     safeSend(dashboard, {
       type: "log",
       index: i,
-      message: `JOB ${jobId} ${ok ? "selesai" : `gagal (${status})`}${responseError(data) && !ok ? `: ${responseError(data)}` : ""}`
+      message: jobMessage
     });
+
+    // room.kick is an API job: queued is not success. Only a terminal
+    // job.get/job.status response is treated as authoritative completion.
+    if (job.command === "room.kick") {
+      safeSend(dashboard, {
+        type: "kick.result",
+        index: i,
+        jobId,
+        room: job.room,
+        target: job.target,
+        status,
+        success: ok,
+        error: ok ? "" : responseError(data)
+      });
+    }
 
     const payload = responsePayload(data);
     const wallet = payload?.wallet || payload?.data?.wallet;
@@ -1289,10 +1310,19 @@ wss.on("connection", dashboard => {
     return true;
   }
 
-  function sendKickToAccount(i, payload) {
-    // Kick traffic is throttled and queued so it cannot monopolize the
-    // same WebSocket used by the application-level keep-alive.
-    return enqueueOutbound(i, payload, {spacingMs: 100});
+  function sendKickToAccount(i, payload, kickQueueId = "") {
+    const accepted = enqueueOutbound(i, payload, {spacingMs: 0});
+    if (accepted) {
+      // room.kick returns its job_id asynchronously. Keep the local request
+      // context in the same per-account send order so the official queued
+      // response can be associated with room/target without guessing.
+      accounts[i].pendingKickDispatches.push({
+        room: String(payload?.room || ""),
+        target: String(payload?.target_username || ""),
+        kickQueueId: String(kickQueueId || "")
+      });
+    }
+    return accepted;
   }
 
   function subscribeRoomText(i, room) {
@@ -1335,6 +1365,7 @@ wss.on("connection", dashboard => {
     );
     const socketDelayMs = Math.max(0, Math.min(60000, Number(options.socketDelayMs) || 0));
     const sequentialMode = options.sequentialMode === true;
+    const kickQueueId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     safeSend(dashboard, {
       type: "kickQueue.start",
       room,
@@ -1344,7 +1375,8 @@ wss.on("connection", dashboard => {
       sequentialMode,
       loopCount,
       total,
-      source
+      source,
+      kickQueueId
     });
 
     commandQueueRunning = true;
@@ -1373,7 +1405,7 @@ wss.on("connection", dashboard => {
             type: "room.kick",
             room,
             target_username: target
-          });
+          }, kickQueueId);
 
           if (didSend) {
             sent++;
@@ -1574,12 +1606,14 @@ wss.on("connection", dashboard => {
       const room = String(msg.room || "").trim();
       if (!room) return;
 
-      // TEST MODE: List User Room tries one logged-in websocket without requiring
-      // a prior room.join. The API may reject this if the room must be joined.
+      // List User Room intentionally uses ONE already-joined websocket only.
+      // The first ready account that has confirmed the room is used as the
+      // participant-list source, so the API is not queried 10 times and the
+      // dashboard receives one authoritative participant response.
       let source = -1;
       for (let n = 0; n < 10; n++) {
         const a = accounts[n];
-        if (a.ready && a.ws?.readyState === WebSocket.OPEN) {
+        if (a.ready && hasJoinedRoom(a, room) && a.ws?.readyState === WebSocket.OPEN) {
           source = n;
           break;
         }
@@ -1589,7 +1623,7 @@ wss.on("connection", dashboard => {
         safeSend(dashboard, {
           type: "error",
           index: 0,
-          message: `Tidak ada ID Online yang siap digunakan untuk mengambil list room ${room}.`
+          message: `Tidak ada ID Online yang tercatat masuk room ${room}. Tekan Enter Room — All terlebih dahulu.`
         });
         return;
       }
