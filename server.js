@@ -1066,14 +1066,23 @@ wss.on("connection", dashboard => {
       // authenticated, while never treating a generic response as success.
       const typeLower = String(data?.type || "").toLowerCase();
       const loginPayload = data?.data ?? data?.result ?? data?.payload ?? data;
+      const loginStatus = String(
+        loginPayload?.status ?? loginPayload?.state ?? loginPayload?.result ??
+        data?.status ?? data?.state ?? ""
+      ).toLowerCase();
+      const loginTypeSuccess =
+        typeLower === "developer.login.result" || typeLower === "login.result" ||
+        typeLower === "developer.login.success" || typeLower === "login.success" ||
+        typeLower === "auth.success" || typeLower === "authentication.success";
+      const loginSuccessFlag = loginPayload?.success === true || data?.success === true;
+      const loginReadyFlag =
+        loginPayload?.authenticated === true || data?.authenticated === true ||
+        loginPayload?.authenticated === "true" || data?.authenticated === "true" ||
+        ["online","success","succeeded","complete","completed","ready","authenticated","connected"].includes(loginStatus);
       const loginSuccess =
-        (typeLower === "developer.login.result" || typeLower === "login.result" ||
-         typeLower === "developer.login.success" || typeLower === "login.success" ||
-         typeLower === "auth.success" || typeLower === "authentication.success") &&
-        loginPayload?.success !== false &&
-        !["error","failed","failure","rejected","denied"].includes(
-          String(loginPayload?.status ?? data?.status ?? "").toLowerCase()
-        );
+        (loginTypeSuccess || loginSuccessFlag || loginReadyFlag) &&
+        loginPayload?.success !== false && data?.success !== false &&
+        !["error","failed","failure","rejected","denied","invalid"].includes(loginStatus);
 
       if (loginSuccess) {
         if (a.authTimer) clearTimeout(a.authTimer);
