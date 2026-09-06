@@ -609,6 +609,61 @@ wss.on("connection", dashboard => {
     }, 50000);
   }
 
+  function closeAccount(i, manual = false) {
+    const a = accounts[i];
+    if (!a) return Promise.resolve();
+
+    a.manuallyClosed = manual === true;
+    a.ready = false;
+    a.authFailed = false;
+    a.joined.clear();
+    a.pendingJoinRoom = "";
+
+    stopPing(i);
+    stopJobPolling(i);
+    stopOutbound(i);
+    if (a.authTimer) clearTimeout(a.authTimer);
+    a.authTimer = null;
+
+    const ws = a.ws;
+    if (!ws) {
+      dashboardStatus(i, "offline");
+      return Promise.resolve();
+    }
+
+    // The MigReborn API has no logout command. Closing the WebSocket is the
+    // protocol-level disconnect. For re-login, wait for the old socket to
+    // actually emit `close` before opening a replacement connection. This
+    // prevents the new login from racing the old active WebSocket.
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (a.ws === ws) a.ws = null;
+        dashboardStatus(i, "offline");
+        resolve();
+      };
+
+      if (ws.readyState === WebSocket.CLOSED) {
+        finish();
+        return;
+      }
+
+      ws.once("close", finish);
+      try {
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          ws.close(1000, manual ? "manual disconnect" : "relogin");
+        } else {
+          finish();
+        }
+      } catch {
+        try { ws.terminate(); } catch {}
+        finish();
+      }
+    });
+  }
+
   function connectAccount(i, options = {}) {
     const a = accounts[i];
     stopPing(i);
@@ -627,7 +682,6 @@ wss.on("connection", dashboard => {
       return;
     }
 
-    try { if (a.ws) a.ws.close(); } catch {}
     dashboardStatus(i, "connecting");
 
     const ws = new WebSocket(MIG_WS_URL);
@@ -730,6 +784,16 @@ wss.on("connection", dashboard => {
         safeSend(dashboard, {type: "log", index: i, message: `API ERROR: ${publicError(err)}`});
 
         // Authentication failures must never enter a reconnect loop.
+        // `developer already has an active websocket` is a connection-state
+        // error, not a credential error; surface it and close this attempt.
+        if (/active websocket/i.test(String(err)) && !a.ready) {
+          a.authFailed = true;
+          a.ready = false;
+          dashboardStatus(i, "error", {authFailed: true, message: publicError(err)});
+          try { ws.close(1000, "active websocket"); } catch {}
+          return;
+        }
+
         if (
           /auth|credential|password|username|login|invalid/i.test(String(err)) &&
           !a.ready
@@ -1097,7 +1161,21 @@ wss.on("connection", dashboard => {
     if (msg.action === "login" && Number.isInteger(i) && i >= 0 && i < 10) {
       accounts[i].username = String(msg.username || "").trim();
       accounts[i].password = String(msg.password || "");
-      connectAccount(i, {resetBackoff: true});
+
+      // The API documents one WebSocket per username. Never let a relogin
+      // race an existing local socket; close it first, then create the new one.
+      for (let n = 0; n < 10; n++) {
+        if (n === i) continue;
+        if (accounts[n].username && accounts[n].username === accounts[i].username) {
+          if (accounts[n].ws || accounts[n].ready) {
+            safeSend(dashboard, {type: "log", index: i, message: `LOGIN dibatalkan: username ${accounts[i].username} sudah dipakai koneksi #${n + 1}`});
+            dashboardStatus(i, "error", {message: "Username sudah memiliki koneksi WebSocket lain"});
+            return;
+          }
+        }
+      }
+
+      closeAccount(i, true).then(() => connectAccount(i, {resetBackoff: true}));
       return;
     }
 
@@ -1107,21 +1185,28 @@ wss.on("connection", dashboard => {
     }
 
     if (msg.action === "loginAll") {
+      const requested = new Map();
       for (let n = 0; n < 10; n++) {
-        if (msg.accounts?.[n]?.username && msg.accounts?.[n]?.password) {
-          accounts[n].username = String(msg.accounts[n].username).trim();
-          accounts[n].password = String(msg.accounts[n].password);
-
-          if (accounts[n].ready && accounts[n].ws?.readyState === WebSocket.OPEN) {
-            safeSend(dashboard, {type: "log", index: n, message: "Login All: sudah Online, login ulang dilewati"});
-            continue;
-          }
-
-          // If an earlier attempt is stuck in CONNECTING/AUTH, discard that
-          // socket and start a fresh connection immediately. No artificial delay.
-          if (accounts[n].ws) closeAccount(n, true);
-          connectAccount(n, {resetBackoff: true});
+        const username = String(msg.accounts?.[n]?.username || "").trim();
+        const password = String(msg.accounts?.[n]?.password || "");
+        if (!username || !password) continue;
+        if (requested.has(username)) {
+          safeSend(dashboard, {type: "log", index: n, message: `Login All dibatalkan untuk #${n + 1}: username ${username} duplikat pada #${requested.get(username) + 1}`});
+          dashboardStatus(n, "error", {message: "Username duplikat; satu username hanya satu koneksi"});
+          continue;
         }
+        requested.set(username, n);
+        accounts[n].username = username;
+        accounts[n].password = password;
+      }
+
+      for (let n = 0; n < 10; n++) {
+        if (!requested.has(accounts[n].username) || !accounts[n].password) continue;
+        if (accounts[n].ready && accounts[n].ws?.readyState === WebSocket.OPEN) {
+          safeSend(dashboard, {type: "log", index: n, message: "Login All: sudah Online, login ulang dilewati"});
+          continue;
+        }
+        closeAccount(n, true).then(() => connectAccount(n, {resetBackoff: true}));
       }
       return;
     }
