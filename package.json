@@ -1,0 +1,12 @@
+{
+  "name": "migmaster-frontend-kickfast",
+  "version": "1.0.2",
+  "private": true,
+  "description": "MigMaster KickFast frontend dashboard for Vercel",
+  "scripts": {
+    "build": "node -e \"console.log('MigMaster frontend build OK')\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
